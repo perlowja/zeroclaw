@@ -803,7 +803,7 @@ impl Agent {
                 None
             };
 
-            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
                     self.observer.record_event(&ObserverEvent::CacheHit {
                         cache_type: "response".into(),
@@ -850,7 +850,7 @@ impl Agent {
                 };
 
                 // Store in response cache (text-only, no tool calls)
-                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
                         .usage
                         .as_ref()
@@ -978,7 +978,7 @@ impl Agent {
                 None
             };
 
-            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
                     self.observer.record_event(&ObserverEvent::CacheHit {
                         cache_type: "response".into(),
@@ -1116,7 +1116,7 @@ impl Agent {
                 };
 
                 // Store in response cache
-                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
                         .usage
                         .as_ref()

@@ -836,7 +836,8 @@ async fn main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
+        // SAFETY: called early in main before any threads are spawned.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
 
     // Completions must remain stdout-only and should not load config or initialize logging.

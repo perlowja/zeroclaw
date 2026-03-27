@@ -1548,7 +1548,8 @@ mod tests {
     impl EnvVarGuard {
         fn unset(key: &'static str) -> Self {
             let original = std::env::var(key).ok();
-            std::env::remove_var(key);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var(key) };
             Self { key, original }
         }
     }
@@ -1556,9 +1557,11 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = &self.original {
-                std::env::set_var(self.key, value);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, value) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }

@@ -785,8 +785,10 @@ mod tests {
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
             match value {
-                Some(next) => std::env::set_var(key, next),
-                None => std::env::remove_var(key),
+                // SAFETY: test-only, single-threaded test runner.
+                Some(next) => unsafe { std::env::set_var(key, next) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(key) },
             }
             Self { key, original }
         }
@@ -795,9 +797,11 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             if let Some(original) = self.original.as_deref() {
-                std::env::set_var(self.key, original);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, original) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }

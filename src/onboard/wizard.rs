@@ -254,7 +254,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -306,7 +307,8 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -368,7 +370,8 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
                 style("Starting channel server...").white().bold()
             );
             println!();
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -6059,13 +6062,15 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         fn unset(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
-            std::env::remove_var(key);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
     }
@@ -6073,9 +6078,11 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, previous) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }

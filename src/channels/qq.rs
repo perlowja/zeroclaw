@@ -1056,7 +1056,7 @@ impl Channel for QQChannel {
         let stored_session = self.session_id.read().await.clone();
         let stored_seq = *self.last_sequence.read().await;
 
-        if let (Some(ref sid), Some(seq)) = (&stored_session, stored_seq) {
+        if let (Some(sid), Some(seq)) = (&stored_session, stored_seq) {
             // Attempt Resume (opcode 6)
             tracing::info!("QQ: attempting session resume (session_id={sid}, seq={seq})");
             let resume = json!({

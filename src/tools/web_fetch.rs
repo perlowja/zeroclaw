@@ -1291,7 +1291,8 @@ mod tests {
     #[tokio::test]
     async fn firecrawl_missing_api_key_returns_error() {
         // Ensure the env var is unset for this test
-        std::env::remove_var("FIRECRAWL_TEST_MISSING_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_TEST_MISSING_KEY") };
 
         let tool = test_tool_with_firecrawl(FirecrawlConfig {
             enabled: true,
@@ -1328,7 +1329,8 @@ mod tests {
             .await;
 
         // Ensure Firecrawl API key env is missing so fallback also fails
-        std::env::remove_var("FIRECRAWL_DOUBLE_FAIL_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_DOUBLE_FAIL_KEY") };
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1414,7 +1416,8 @@ mod tests {
             .await;
 
         // Set up API key env var for this test
-        std::env::set_var("FIRECRAWL_E2E_TEST_KEY", "test-key-12345");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("FIRECRAWL_E2E_TEST_KEY", "test-key-12345") };
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1461,7 +1464,8 @@ mod tests {
         );
 
         // Clean up env var
-        std::env::remove_var("FIRECRAWL_E2E_TEST_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_E2E_TEST_KEY") };
     }
 
     // ── Allowed private hosts ─────────────────────────────────────
