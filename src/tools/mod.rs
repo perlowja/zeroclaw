@@ -115,7 +115,7 @@ pub mod wrappers;
 
 pub use ask_user::AskUserTool;
 pub use backup_tool::BackupTool;
-pub use browser::{BrowserTool, ComputerUseConfig};
+pub use browser::{BrowserTool, ComputerUseConfig, SeleniumBaseBridgeConfig};
 #[allow(unused_imports)]
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
@@ -535,6 +535,12 @@ pub fn all_tools_with_runtime(
                 window_allowlist: browser_config.computer_use.window_allowlist.clone(),
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
+            SeleniumBaseBridgeConfig {
+                bridge_script_path: browser_config.seleniumbase.bridge_script_path.clone(),
+                python_command: browser_config.seleniumbase.python_command.clone(),
+                reconnect_timeout: browser_config.seleniumbase.reconnect_timeout,
+                extra_driver_args: browser_config.seleniumbase.extra_driver_args.clone(),
             },
         )));
     }

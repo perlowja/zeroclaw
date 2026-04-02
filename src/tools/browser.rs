@@ -15,6 +15,7 @@ use std::net::ToSocketAddrs;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::debug;
 
@@ -57,6 +58,39 @@ impl Default for ComputerUseConfig {
     }
 }
 
+/// The SeleniumBase bridge script, embedded at compile time.
+const SELENIUMBASE_BRIDGE_SCRIPT: &str =
+    include_str!("../../scripts/browser/zeroclaw-sbase-bridge.py");
+
+/// SeleniumBase subprocess handle.
+struct SeleniumBaseProcess {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+    /// Keeps the temp file alive for the lifetime of the subprocess.
+    _script_tempfile: Option<tempfile::NamedTempFile>,
+}
+
+/// SeleniumBase UC-mode bridge settings (passed from config).
+#[derive(Clone, Debug)]
+pub struct SeleniumBaseBridgeConfig {
+    pub bridge_script_path: Option<String>,
+    pub python_command: String,
+    pub reconnect_timeout: u64,
+    pub extra_driver_args: Vec<String>,
+}
+
+impl Default for SeleniumBaseBridgeConfig {
+    fn default() -> Self {
+        Self {
+            bridge_script_path: None,
+            python_command: "python3".into(),
+            reconnect_timeout: 4,
+            extra_driver_args: Vec::new(),
+        }
+    }
+}
+
 /// Browser automation tool using pluggable backends.
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
@@ -67,6 +101,8 @@ pub struct BrowserTool {
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    seleniumbase_config: SeleniumBaseBridgeConfig,
+    seleniumbase_process: tokio::sync::Mutex<Option<SeleniumBaseProcess>>,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -76,6 +112,7 @@ enum BrowserBackendKind {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    SeleniumBase,
     Auto,
 }
 
@@ -84,6 +121,7 @@ enum ResolvedBackend {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    SeleniumBase,
 }
 
 impl BrowserBackendKind {
@@ -93,9 +131,10 @@ impl BrowserBackendKind {
             "agent_browser" | "agentbrowser" => Ok(Self::AgentBrowser),
             "rust_native" | "native" => Ok(Self::RustNative),
             "computer_use" | "computeruse" => Ok(Self::ComputerUse),
+            "seleniumbase" | "selenium_base" | "sbase" => Ok(Self::SeleniumBase),
             "auto" => Ok(Self::Auto),
             _ => anyhow::bail!(
-                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', or 'auto'"
+                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', 'seleniumbase', or 'auto'"
             ),
         }
     }
@@ -105,6 +144,7 @@ impl BrowserBackendKind {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
             Self::ComputerUse => "computer_use",
+            Self::SeleniumBase => "seleniumbase",
             Self::Auto => "auto",
         }
     }
@@ -211,6 +251,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            SeleniumBaseBridgeConfig::default(),
         )
     }
 
@@ -224,6 +265,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        seleniumbase_config: SeleniumBaseBridgeConfig,
     ) -> Self {
         Self {
             security,
@@ -234,6 +276,8 @@ impl BrowserTool {
             native_webdriver_url,
             native_chrome_path,
             computer_use,
+            seleniumbase_config,
+            seleniumbase_process: tokio::sync::Mutex::new(None),
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -370,9 +414,22 @@ impl BrowserTool {
                 }
                 Ok(ResolvedBackend::ComputerUse)
             }
+            BrowserBackendKind::SeleniumBase => {
+                if Self::is_seleniumbase_available().await {
+                    Ok(ResolvedBackend::SeleniumBase)
+                } else {
+                    anyhow::bail!(
+                        "browser.backend='seleniumbase' but SeleniumBase is not installed. \
+                         Install with: pip install seleniumbase"
+                    )
+                }
+            }
             BrowserBackendKind::Auto => {
                 if Self::rust_native_compiled() && self.rust_native_available() {
                     return Ok(ResolvedBackend::RustNative);
+                }
+                if Self::is_seleniumbase_available().await {
+                    return Ok(ResolvedBackend::SeleniumBase);
                 }
                 if Self::is_agent_browser_available().await {
                     return Ok(ResolvedBackend::AgentBrowser);
@@ -699,6 +756,237 @@ impl BrowserTool {
         }
     }
 
+    /// Check if SeleniumBase is installed and importable.
+    pub async fn is_seleniumbase_available() -> bool {
+        Command::new("python3")
+            .args(["-c", "import seleniumbase"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Resolve the bridge script path. If a user override is set, returns that
+    /// path with no temp file. Otherwise writes the embedded script to a temp
+    /// file and returns its path along with the handle (must stay alive).
+    fn resolve_bridge_script(&self) -> anyhow::Result<(String, Option<tempfile::NamedTempFile>)> {
+        if let Some(ref explicit) = self.seleniumbase_config.bridge_script_path {
+            return Ok((explicit.clone(), None));
+        }
+        // Write the compile-time-embedded bridge script to a temp file.
+        let tmp = tempfile::Builder::new()
+            .prefix("zeroclaw-sbase-bridge-")
+            .suffix(".py")
+            .tempfile()
+            .context("Failed to create temp file for SeleniumBase bridge script")?;
+        std::fs::write(tmp.path(), SELENIUMBASE_BRIDGE_SCRIPT)
+            .context("Failed to write embedded bridge script to temp file")?;
+        let path = tmp.path().to_string_lossy().into_owned();
+        Ok((path, Some(tmp)))
+    }
+
+    /// Spawn or return the existing SeleniumBase bridge subprocess.
+    async fn ensure_seleniumbase_process(&self) -> anyhow::Result<()> {
+        let mut guard = self.seleniumbase_process.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        let (script, tempfile) = self.resolve_bridge_script()?;
+        let python = &self.seleniumbase_config.python_command;
+
+        let mut cmd = Command::new(python);
+        cmd.arg("-u") // unbuffered stdout
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Pass config via environment variables
+        cmd.env(
+            "ZEROCLAW_SBASE_RECONNECT_TIMEOUT",
+            self.seleniumbase_config.reconnect_timeout.to_string(),
+        );
+        if !self.seleniumbase_config.extra_driver_args.is_empty() {
+            cmd.env(
+                "ZEROCLAW_SBASE_EXTRA_ARGS",
+                self.seleniumbase_config.extra_driver_args.join(","),
+            );
+        }
+
+        if is_service_environment() {
+            ensure_browser_env(&mut cmd);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn SeleniumBase bridge: {python} {script}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdin of SeleniumBase bridge"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout of SeleniumBase bridge"))?;
+        let stdout = tokio::io::BufReader::new(stdout);
+
+        let mut proc = SeleniumBaseProcess {
+            child,
+            stdin,
+            stdout,
+            _script_tempfile: tempfile,
+        };
+
+        // Read the initial "ready" message
+        let mut ready_line = String::new();
+        proc.stdout
+            .read_line(&mut ready_line)
+            .await
+            .with_context(|| "SeleniumBase bridge did not emit ready signal")?;
+
+        if let Ok(resp) = serde_json::from_str::<AgentBrowserResponse>(&ready_line) {
+            if !resp.success {
+                let err = resp.error.unwrap_or_else(|| "unknown error".into());
+                anyhow::bail!("SeleniumBase bridge failed to start: {err}");
+            }
+        }
+
+        *guard = Some(proc);
+        Ok(())
+    }
+
+    /// Send a JSON command to the SeleniumBase bridge and read the response.
+    async fn seleniumbase_send_command(&self, cmd: &Value) -> anyhow::Result<AgentBrowserResponse> {
+        let mut guard = self.seleniumbase_process.lock().await;
+        let proc = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("SeleniumBase bridge not running"))?;
+
+        let mut line = serde_json::to_string(cmd)?;
+        line.push('\n');
+
+        proc.stdin
+            .write_all(line.as_bytes())
+            .await
+            .context("Failed to write to SeleniumBase bridge stdin")?;
+        proc.stdin
+            .flush()
+            .await
+            .context("Failed to flush SeleniumBase bridge stdin")?;
+
+        let mut response_line = String::new();
+        proc.stdout
+            .read_line(&mut response_line)
+            .await
+            .context("Failed to read from SeleniumBase bridge stdout")?;
+
+        if response_line.is_empty() {
+            anyhow::bail!("SeleniumBase bridge closed unexpectedly");
+        }
+
+        serde_json::from_str::<AgentBrowserResponse>(&response_line)
+            .context("Failed to parse SeleniumBase bridge JSON response")
+    }
+
+    /// Execute a browser action via SeleniumBase UC-mode bridge subprocess.
+    async fn execute_seleniumbase_action(
+        &self,
+        action: BrowserAction,
+    ) -> anyhow::Result<ToolResult> {
+        // Ensure subprocess is running
+        self.ensure_seleniumbase_process().await?;
+
+        // Build the JSON command from the BrowserAction
+        let cmd = match &action {
+            BrowserAction::Open { url } => {
+                self.validate_url(url)?;
+                json!({"action": "open", "url": url})
+            }
+            BrowserAction::Snapshot { .. } => json!({"action": "snapshot"}),
+            BrowserAction::Click { selector } => {
+                json!({"action": "click", "selector": selector})
+            }
+            BrowserAction::Fill { selector, value } => {
+                json!({"action": "fill", "selector": selector, "value": value})
+            }
+            BrowserAction::Type { selector, text } => {
+                json!({"action": "type", "selector": selector, "text": text})
+            }
+            BrowserAction::GetText { selector } => {
+                json!({"action": "get_text", "selector": selector})
+            }
+            BrowserAction::GetTitle => json!({"action": "get_title"}),
+            BrowserAction::GetUrl => json!({"action": "get_url"}),
+            BrowserAction::Screenshot { path, full_page: _ } => {
+                let mut cmd = json!({"action": "screenshot"});
+                if let Some(p) = path {
+                    cmd["path"] = json!(p);
+                }
+                cmd
+            }
+            BrowserAction::Wait { selector, ms, text } => {
+                let mut cmd = json!({"action": "wait"});
+                if let Some(s) = selector {
+                    cmd["selector"] = json!(s);
+                }
+                if let Some(m) = ms {
+                    cmd["ms"] = json!(m);
+                }
+                if let Some(t) = text {
+                    cmd["text"] = json!(t);
+                }
+                cmd
+            }
+            BrowserAction::Press { key } => json!({"action": "press", "key": key}),
+            BrowserAction::Hover { selector } => {
+                json!({"action": "hover", "selector": selector})
+            }
+            BrowserAction::Scroll { direction, pixels } => {
+                let mut cmd = json!({"action": "scroll", "direction": direction});
+                if let Some(px) = pixels {
+                    cmd["pixels"] = json!(px);
+                }
+                cmd
+            }
+            BrowserAction::IsVisible { selector } => {
+                json!({"action": "is_visible", "selector": selector})
+            }
+            BrowserAction::Close => json!({"action": "close"}),
+            BrowserAction::Find {
+                by,
+                value,
+                action,
+                fill_value,
+            } => {
+                let mut cmd = json!({"action": "click", "selector": format!("[{by}={value}]")});
+                if action == "fill" {
+                    cmd = json!({"action": "fill", "selector": format!("[{by}={value}]"), "value": fill_value.as_deref().unwrap_or("")});
+                } else if action == "text" {
+                    cmd = json!({"action": "get_text", "selector": format!("[{by}={value}]")});
+                } else if action == "hover" {
+                    cmd = json!({"action": "hover", "selector": format!("[{by}={value}]")});
+                }
+                cmd
+            }
+        };
+
+        let resp = self.seleniumbase_send_command(&cmd).await?;
+
+        // Clean up subprocess on close
+        if matches!(action, BrowserAction::Close) {
+            let mut guard = self.seleniumbase_process.lock().await;
+            if let Some(mut proc) = guard.take() {
+                let _ = proc.child.kill().await;
+            }
+        }
+
+        self.to_result(resp)
+    }
+
     fn validate_coordinate(&self, key: &str, value: i64, max: Option<i64>) -> anyhow::Result<()> {
         if value < 0 {
             anyhow::bail!("'{key}' must be >= 0")
@@ -880,6 +1168,7 @@ impl BrowserTool {
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
+            ResolvedBackend::SeleniumBase => self.execute_seleniumbase_action(action).await,
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
@@ -916,10 +1205,11 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         concat!(
-            "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). ",
+            "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use, seleniumbase). ",
             "Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, ",
             "key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map ",
-            "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions."
+            "interactive elements to refs (@e1, @e2). SeleniumBase backend provides stealth anti-detection ",
+            "browsing (Cloudflare, DataDome). Enforces browser.allowed_domains for open actions."
         )
     }
 
@@ -1990,6 +2280,7 @@ fn backend_name(backend: ResolvedBackend) -> &'static str {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",
         ResolvedBackend::ComputerUse => "computer_use",
+        ResolvedBackend::SeleniumBase => "seleniumbase",
     }
 }
 
@@ -2334,6 +2625,10 @@ mod tests {
             BrowserBackendKind::ComputerUse
         );
         assert_eq!(
+            BrowserBackendKind::parse("seleniumbase").unwrap(),
+            BrowserBackendKind::SeleniumBase
+        );
+        assert_eq!(
             BrowserBackendKind::parse("auto").unwrap(),
             BrowserBackendKind::Auto
         );
@@ -2366,6 +2661,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            SeleniumBaseBridgeConfig::default(),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
@@ -2382,6 +2678,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            SeleniumBaseBridgeConfig::default(),
         );
         assert_eq!(
             tool.configured_backend().unwrap(),
@@ -2404,6 +2701,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            SeleniumBaseBridgeConfig::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_err());
@@ -2425,6 +2723,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            SeleniumBaseBridgeConfig::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_ok());
@@ -2446,6 +2745,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            SeleniumBaseBridgeConfig::default(),
         );
 
         assert!(
@@ -2653,5 +2953,416 @@ mod tests {
         } else {
             assert_eq!(cmd, "agent-browser");
         }
+    }
+
+    #[test]
+    fn seleniumbase_backend_parse_aliases() {
+        assert_eq!(
+            BrowserBackendKind::parse("seleniumbase").unwrap(),
+            BrowserBackendKind::SeleniumBase
+        );
+        assert_eq!(
+            BrowserBackendKind::parse("selenium_base").unwrap(),
+            BrowserBackendKind::SeleniumBase
+        );
+        assert_eq!(
+            BrowserBackendKind::parse("sbase").unwrap(),
+            BrowserBackendKind::SeleniumBase
+        );
+        assert_eq!(
+            BrowserBackendKind::parse("SeleniumBase").unwrap(),
+            BrowserBackendKind::SeleniumBase
+        );
+    }
+
+    #[test]
+    fn seleniumbase_backend_as_str_roundtrip() {
+        let kind = BrowserBackendKind::SeleniumBase;
+        assert_eq!(kind.as_str(), "seleniumbase");
+        assert_eq!(
+            BrowserBackendKind::parse(kind.as_str()).unwrap(),
+            BrowserBackendKind::SeleniumBase
+        );
+    }
+
+    #[test]
+    fn browser_tool_accepts_seleniumbase_backend_config() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "seleniumbase".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            SeleniumBaseBridgeConfig::default(),
+        );
+        assert_eq!(
+            tool.configured_backend().unwrap(),
+            BrowserBackendKind::SeleniumBase
+        );
+    }
+
+    #[test]
+    fn seleniumbase_backend_name_in_error_message() {
+        assert_eq!(
+            unavailable_action_for_backend_error("mouse_move", ResolvedBackend::SeleniumBase),
+            "Action 'mouse_move' is unavailable for backend 'seleniumbase'"
+        );
+    }
+
+    #[test]
+    fn seleniumbase_bridge_config_defaults() {
+        let cfg = SeleniumBaseBridgeConfig::default();
+        assert!(cfg.bridge_script_path.is_none());
+        assert_eq!(cfg.python_command, "python3");
+        assert_eq!(cfg.reconnect_timeout, 4);
+        assert!(cfg.extra_driver_args.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // SeleniumBase bridge subprocess integration tests
+    //
+    // These use a mock Python script implementing the bridge JSON protocol,
+    // verifying the Rust subprocess lifecycle and communication without
+    // needing seleniumbase or a real browser.
+    // -----------------------------------------------------------------------
+
+    /// Mock bridge script: implements the JSON stdin/stdout protocol used by
+    /// the real `zeroclaw-sbase-bridge.py`, but returns canned responses.
+    const MOCK_SBASE_BRIDGE: &str = r#"
+import json, sys
+
+def respond(d):
+    sys.stdout.write(json.dumps(d) + "\n")
+    sys.stdout.flush()
+
+respond({"success": True, "data": {"status": "ready"}})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        cmd = json.loads(line)
+    except Exception as e:
+        respond({"success": False, "error": str(e)})
+        continue
+    action = cmd.get("action", "")
+    if action == "open":
+        respond({"success": True, "data": {"url": cmd.get("url", "")}})
+    elif action == "get_title":
+        respond({"success": True, "data": {"output": "Mock Title"}})
+    elif action == "get_url":
+        respond({"success": True, "data": {"output": "https://mock.test/page"}})
+    elif action == "snapshot":
+        respond({"success": True, "data": {"title": "Mock Title", "url": "https://mock.test", "text": "Mock page content"}})
+    elif action == "click":
+        respond({"success": True, "data": {"clicked": cmd.get("selector", "")}})
+    elif action == "fill":
+        respond({"success": True, "data": {"filled": cmd.get("selector", ""), "value": cmd.get("value", "")}})
+    elif action == "type":
+        respond({"success": True, "data": {"typed": cmd.get("selector", ""), "text": cmd.get("text", "")}})
+    elif action == "get_text":
+        respond({"success": True, "data": {"output": "Mock element text"}})
+    elif action == "screenshot":
+        respond({"success": True, "data": {"path": cmd.get("path", "/tmp/mock.png")}})
+    elif action == "wait":
+        respond({"success": True, "data": {"waited_ms": cmd.get("ms", 0)}})
+    elif action == "press":
+        respond({"success": True, "data": {"pressed": cmd.get("key", "")}})
+    elif action == "hover":
+        respond({"success": True, "data": {"hovered": cmd.get("selector", "")}})
+    elif action == "scroll":
+        respond({"success": True, "data": {"scrolled": cmd.get("direction", "down"), "pixels": cmd.get("pixels", 300)}})
+    elif action == "is_visible":
+        respond({"success": True, "data": {"visible": True, "selector": cmd.get("selector", "")}})
+    elif action == "close":
+        respond({"success": True, "data": {"closed": True}})
+        break
+    else:
+        respond({"success": False, "error": "Unknown action: " + action})
+"#;
+
+    /// Create a `BrowserTool` configured with a mock bridge script.
+    /// Returns both the tool and the tempfile handle (must be kept alive).
+    fn mock_seleniumbase_tool(script: &str) -> (BrowserTool, tempfile::NamedTempFile) {
+        let tmp = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+        std::fs::write(tmp.path(), script).unwrap();
+
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "seleniumbase".into(),
+            true,
+            "".into(),
+            None,
+            ComputerUseConfig::default(),
+            SeleniumBaseBridgeConfig {
+                bridge_script_path: Some(tmp.path().to_string_lossy().into_owned()),
+                python_command: "python3".into(),
+                reconnect_timeout: 4,
+                extra_driver_args: vec![],
+            },
+        );
+
+        (tool, tmp)
+    }
+
+    #[tokio::test]
+    async fn seleniumbase_bridge_spawn_and_ready_signal() {
+        let (tool, _tmp) = mock_seleniumbase_tool(MOCK_SBASE_BRIDGE);
+
+        // Spawn the bridge and verify it reads the ready signal
+        tool.ensure_seleniumbase_process().await.unwrap();
+
+        let guard = tool.seleniumbase_process.lock().await;
+        assert!(guard.is_some(), "subprocess should be stored after spawn");
+    }
+
+    #[tokio::test]
+    async fn seleniumbase_bridge_open_and_close_lifecycle() {
+        let (tool, _tmp) = mock_seleniumbase_tool(MOCK_SBASE_BRIDGE);
+        tool.ensure_seleniumbase_process().await.unwrap();
+
+        // Open
+        let resp = tool
+            .seleniumbase_send_command(
+                &serde_json::json!({"action": "open", "url": "https://example.com"}),
+            )
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["url"], "https://example.com");
+
+        // Close
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "close"}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["closed"], true);
+    }
+
+    #[tokio::test]
+    async fn seleniumbase_bridge_query_actions() {
+        let (tool, _tmp) = mock_seleniumbase_tool(MOCK_SBASE_BRIDGE);
+        tool.ensure_seleniumbase_process().await.unwrap();
+
+        // get_title
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "get_title"}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["output"], "Mock Title");
+
+        // get_url
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "get_url"}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(
+            resp.data.as_ref().unwrap()["output"],
+            "https://mock.test/page"
+        );
+
+        // snapshot
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "snapshot"}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        let data = resp.data.as_ref().unwrap();
+        assert_eq!(data["title"], "Mock Title");
+        assert_eq!(data["text"], "Mock page content");
+
+        // get_text
+        let resp = tool
+            .seleniumbase_send_command(
+                &serde_json::json!({"action": "get_text", "selector": "#content"}),
+            )
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["output"], "Mock element text");
+
+        // is_visible
+        let resp = tool
+            .seleniumbase_send_command(
+                &serde_json::json!({"action": "is_visible", "selector": "#el"}),
+            )
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["visible"], true);
+
+        let _ = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "close"}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn seleniumbase_bridge_interaction_actions() {
+        let (tool, _tmp) = mock_seleniumbase_tool(MOCK_SBASE_BRIDGE);
+        tool.ensure_seleniumbase_process().await.unwrap();
+
+        // click
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "click", "selector": "#btn"}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["clicked"], "#btn");
+
+        // fill
+        let resp = tool
+            .seleniumbase_send_command(
+                &serde_json::json!({"action": "fill", "selector": "#input", "value": "hello"}),
+            )
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["filled"], "#input");
+        assert_eq!(resp.data.as_ref().unwrap()["value"], "hello");
+
+        // type
+        let resp = tool
+            .seleniumbase_send_command(
+                &serde_json::json!({"action": "type", "selector": "#field", "text": "world"}),
+            )
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["typed"], "#field");
+
+        // press
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "press", "key": "Enter"}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["pressed"], "Enter");
+
+        // hover
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "hover", "selector": "#link"}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["hovered"], "#link");
+
+        // scroll
+        let resp = tool
+            .seleniumbase_send_command(
+                &serde_json::json!({"action": "scroll", "direction": "down", "pixels": 500}),
+            )
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["scrolled"], "down");
+
+        // screenshot
+        let resp = tool
+            .seleniumbase_send_command(
+                &serde_json::json!({"action": "screenshot", "path": "/tmp/test.png"}),
+            )
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["path"], "/tmp/test.png");
+
+        // wait
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "wait", "ms": 100}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.data.as_ref().unwrap()["waited_ms"], 100);
+
+        let _ = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "close"}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn seleniumbase_bridge_unknown_action_returns_error() {
+        let (tool, _tmp) = mock_seleniumbase_tool(MOCK_SBASE_BRIDGE);
+        tool.ensure_seleniumbase_process().await.unwrap();
+
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "nonexistent_action"}))
+            .await
+            .unwrap();
+        assert!(!resp.success);
+        assert!(resp.error.as_ref().unwrap().contains("Unknown action"));
+
+        let _ = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "close"}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn seleniumbase_bridge_send_before_spawn_fails() {
+        let (tool, _tmp) = mock_seleniumbase_tool(MOCK_SBASE_BRIDGE);
+        // Do NOT call ensure_seleniumbase_process
+
+        let result = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "get_title"}))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not running"),
+            "should report bridge not running"
+        );
+    }
+
+    #[tokio::test]
+    async fn seleniumbase_bridge_failed_ready_signal() {
+        let bad_script = r#"
+import json, sys
+sys.stdout.write(json.dumps({"success": False, "error": "seleniumbase not installed"}) + "\n")
+sys.stdout.flush()
+"#;
+        let (tool, _tmp) = mock_seleniumbase_tool(bad_script);
+
+        let result = tool.ensure_seleniumbase_process().await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("failed to start"),
+            "should report bridge failed to start"
+        );
+    }
+
+    #[tokio::test]
+    async fn seleniumbase_bridge_idempotent_ensure() {
+        let (tool, _tmp) = mock_seleniumbase_tool(MOCK_SBASE_BRIDGE);
+
+        // Calling ensure twice should be fine (second is a no-op)
+        tool.ensure_seleniumbase_process().await.unwrap();
+        tool.ensure_seleniumbase_process().await.unwrap();
+
+        // Should still work
+        let resp = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "get_title"}))
+            .await
+            .unwrap();
+        assert!(resp.success);
+
+        let _ = tool
+            .seleniumbase_send_command(&serde_json::json!({"action": "close"}))
+            .await;
+    }
+
+    #[test]
+    fn seleniumbase_embedded_bridge_script_is_valid() {
+        assert!(SELENIUMBASE_BRIDGE_SCRIPT.contains("def main()"));
+        assert!(SELENIUMBASE_BRIDGE_SCRIPT.contains("action_open"));
+        assert!(SELENIUMBASE_BRIDGE_SCRIPT.contains(r#""status": "ready""#));
     }
 }

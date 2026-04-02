@@ -2446,6 +2446,46 @@ impl Default for BrowserComputerUseConfig {
     }
 }
 
+/// SeleniumBase UC-mode (stealth browser) configuration (`[browser.seleniumbase]` section).
+///
+/// Wraps SeleniumBase's Undetected Chrome mode via a Python subprocess bridge
+/// for anti-detection browsing (Cloudflare, DataDome, Imperva).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SeleniumBaseConfig {
+    /// Optional override path to a custom bridge script.
+    /// If not set, uses the bridge script embedded in the binary.
+    #[serde(default)]
+    pub bridge_script_path: Option<String>,
+    /// Python executable to use (default: "python3")
+    #[serde(default = "default_sbase_python_command")]
+    pub python_command: String,
+    /// Reconnect timeout in seconds for `uc_open_with_reconnect` (default: 4)
+    #[serde(default = "default_sbase_reconnect_timeout")]
+    pub reconnect_timeout: u64,
+    /// Extra SeleniumBase `Driver()` kwargs as `key=value` pairs
+    #[serde(default)]
+    pub extra_driver_args: Vec<String>,
+}
+
+fn default_sbase_python_command() -> String {
+    "python3".into()
+}
+
+fn default_sbase_reconnect_timeout() -> u64 {
+    4
+}
+
+impl Default for SeleniumBaseConfig {
+    fn default() -> Self {
+        Self {
+            bridge_script_path: None,
+            python_command: default_sbase_python_command(),
+            reconnect_timeout: default_sbase_reconnect_timeout(),
+            extra_driver_args: Vec::new(),
+        }
+    }
+}
+
 /// Browser automation configuration (`[browser]` section).
 ///
 /// Controls the `browser_open` tool and browser automation backends.
@@ -2475,6 +2515,9 @@ pub struct BrowserConfig {
     /// Computer-use sidecar configuration
     #[serde(default)]
     pub computer_use: BrowserComputerUseConfig,
+    /// SeleniumBase UC-mode (stealth browser) configuration
+    #[serde(default)]
+    pub seleniumbase: SeleniumBaseConfig,
 }
 
 fn default_browser_backend() -> String {
@@ -2496,6 +2539,7 @@ impl Default for BrowserConfig {
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
+            seleniumbase: SeleniumBaseConfig::default(),
         }
     }
 }
@@ -13236,6 +13280,7 @@ default_temperature = 0.7
                 max_coordinate_x: Some(3840),
                 max_coordinate_y: Some(2160),
             },
+            seleniumbase: SeleniumBaseConfig::default(),
         };
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
@@ -13271,6 +13316,68 @@ default_temperature = 0.7
         let parsed = parse_test_config(minimal);
         assert!(parsed.browser.enabled);
         assert_eq!(parsed.browser.allowed_domains, vec!["*".to_string()]);
+    }
+
+    #[test]
+    async fn seleniumbase_config_defaults() {
+        let cfg = SeleniumBaseConfig::default();
+        assert!(cfg.bridge_script_path.is_none());
+        assert_eq!(cfg.python_command, "python3");
+        assert_eq!(cfg.reconnect_timeout, 4);
+        assert!(cfg.extra_driver_args.is_empty());
+    }
+
+    #[test]
+    async fn seleniumbase_config_serde_roundtrip() {
+        let cfg = SeleniumBaseConfig {
+            bridge_script_path: Some("/custom/bridge.py".into()),
+            python_command: "python3.11".into(),
+            reconnect_timeout: 8,
+            extra_driver_args: vec!["locale_code=en".into(), "ad_block_on=True".into()],
+        };
+        let toml_str = toml::to_string(&cfg).unwrap();
+        let parsed: SeleniumBaseConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed.bridge_script_path.as_deref(),
+            Some("/custom/bridge.py")
+        );
+        assert_eq!(parsed.python_command, "python3.11");
+        assert_eq!(parsed.reconnect_timeout, 8);
+        assert_eq!(parsed.extra_driver_args.len(), 2);
+    }
+
+    #[test]
+    async fn seleniumbase_backward_compat_missing_section() {
+        let browser_toml = r#"
+enabled = true
+allowed_domains = ["example.com"]
+backend = "agent_browser"
+"#;
+        let parsed: BrowserConfig = toml::from_str(browser_toml).unwrap();
+        assert!(parsed.enabled);
+        // seleniumbase should use defaults when section is missing
+        assert!(parsed.seleniumbase.bridge_script_path.is_none());
+        assert_eq!(parsed.seleniumbase.python_command, "python3");
+        assert_eq!(parsed.seleniumbase.reconnect_timeout, 4);
+    }
+
+    #[test]
+    async fn browser_config_with_seleniumbase_section() {
+        let browser_toml = r#"
+enabled = true
+allowed_domains = ["*"]
+backend = "seleniumbase"
+
+[seleniumbase]
+python_command = "python3.12"
+reconnect_timeout = 6
+extra_driver_args = ["block_images=True"]
+"#;
+        let parsed: BrowserConfig = toml::from_str(browser_toml).unwrap();
+        assert_eq!(parsed.backend, "seleniumbase");
+        assert_eq!(parsed.seleniumbase.python_command, "python3.12");
+        assert_eq!(parsed.seleniumbase.reconnect_timeout, 6);
+        assert_eq!(parsed.seleniumbase.extra_driver_args.len(), 1);
     }
 
     // ── Environment variable overrides (Docker support) ─────────
