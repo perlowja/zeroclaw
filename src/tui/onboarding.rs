@@ -1499,7 +1499,7 @@ fn handle_input(app: &mut App, key: KeyCode) {
         Screen::ToolModeSelect => match key {
             KeyCode::Up | KeyCode::Char('k') => nav_up(&mut app.tool_mode_idx),
             KeyCode::Down | KeyCode::Char('j') => {
-                nav_down(&mut app.tool_mode_idx, TOOL_MODES.len() - 1)
+                nav_down(&mut app.tool_mode_idx, TOOL_MODES.len() - 1);
             }
             KeyCode::Char('s' | 'S') => app.secrets_encrypt = !app.secrets_encrypt,
             KeyCode::Enter => {
@@ -4818,5 +4818,135 @@ mod tests {
         assert!(!config.hardware.enabled);
         assert_eq!(config.memory.backend, "lucid");
         assert!(!config.memory.auto_save);
+    }
+
+    // ── Config round-trip: save to disk and verify TOML ─────────────
+
+    #[tokio::test]
+    async fn config_round_trip_full_setup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_dir = temp.path().join("zeroclaw");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        let mut app = test_app_full_setup();
+        app.api_key_input = "sk-roundtrip-test".to_string();
+        app.tunnel_provider_idx = 1; // Cloudflare
+        app.tunnel_token_input = "cf-rt-token".to_string();
+        app.tool_mode_idx = 0; // Sovereign
+        app.secrets_encrypt = false; // Disable encryption for round-trip readability
+        app.hardware_mode_idx = 2; // Serial
+        app.hardware_serial_port_input = "/dev/ttyUSB0".to_string();
+        app.memory_backend_idx = 0; // SQLite
+        app.memory_auto_save = true;
+        app.search_provider_idx = 4; // DuckDuckGo
+        app.hooks_idx = 0; // Enabled
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        apply_tui_selections_to_config(&app, &mut config);
+
+        // Save to disk
+        config.save().await.unwrap();
+
+        // Read back the TOML
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+
+        // Note: workspace_dir is #[serde(skip)] so it's NOT in the TOML.
+        // It's resolved at runtime from the config directory location.
+        // The scaffold uses app.workspace_dir_input directly.
+
+        // Verify key fields survived the round-trip
+        assert!(raw.contains("sk-roundtrip-test"), "api_key in TOML");
+        assert!(
+            raw.contains("provider = \"cloudflare\""),
+            "tunnel provider in TOML"
+        );
+        assert!(raw.contains("cf-rt-token"), "tunnel token in TOML");
+        assert!(
+            raw.contains("backend = \"sqlite\""),
+            "memory backend in TOML"
+        );
+        assert!(raw.contains("auto_save = true"), "memory auto_save in TOML");
+        assert!(
+            raw.contains("provider = \"duckduckgo\""),
+            "web search provider in TOML"
+        );
+        assert!(raw.contains("[hooks]"), "hooks section in TOML");
+        assert!(raw.contains("/dev/ttyUSB0"), "hardware serial port in TOML");
+    }
+
+    // ── Scaffold integration tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn scaffold_creates_personalized_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("ws");
+        let ctx = crate::onboard::ProjectContext {
+            user_name: "ScaffoldUser".to_string(),
+            agent_name: "ScaffoldBot".to_string(),
+            timezone: "America/New_York".to_string(),
+            communication_style: "Direct and concise".to_string(),
+        };
+        crate::onboard::scaffold_workspace(&workspace, &ctx, "sqlite")
+            .await
+            .unwrap();
+
+        // All markdown files should exist
+        for f in &[
+            "IDENTITY.md",
+            "AGENTS.md",
+            "HEARTBEAT.md",
+            "SOUL.md",
+            "USER.md",
+            "TOOLS.md",
+            "BOOTSTRAP.md",
+            "MEMORY.md",
+        ] {
+            assert!(workspace.join(f).exists(), "missing scaffold file: {f}");
+        }
+
+        // All subdirectories should exist
+        for d in &["sessions", "memory", "state", "cron", "skills"] {
+            assert!(workspace.join(d).is_dir(), "missing scaffold dir: {d}");
+        }
+
+        // Content spot-checks
+        let identity = std::fs::read_to_string(workspace.join("IDENTITY.md")).unwrap();
+        assert!(
+            identity.contains("ScaffoldBot"),
+            "IDENTITY.md should contain agent name"
+        );
+        let user_md = std::fs::read_to_string(workspace.join("USER.md")).unwrap();
+        assert!(
+            user_md.contains("ScaffoldUser"),
+            "USER.md should contain user name"
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_skips_memory_md_for_none_backend() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("ws");
+        let ctx = crate::onboard::ProjectContext {
+            user_name: "User".to_string(),
+            agent_name: "Agent".to_string(),
+            timezone: "UTC".to_string(),
+            communication_style: "Warm".to_string(),
+        };
+        crate::onboard::scaffold_workspace(&workspace, &ctx, "none")
+            .await
+            .unwrap();
+
+        // MEMORY.md should NOT exist when backend is "none"
+        assert!(
+            !workspace.join("MEMORY.md").exists(),
+            "MEMORY.md should not exist for 'none' backend"
+        );
+
+        // But other files should still exist
+        assert!(workspace.join("SOUL.md").exists());
+        assert!(workspace.join("USER.md").exists());
+        assert!(workspace.join("IDENTITY.md").exists());
     }
 }
