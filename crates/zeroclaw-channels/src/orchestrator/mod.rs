@@ -4004,6 +4004,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 Ok(Arc::new(MatrixChannel::new(
                     mx.homeserver.clone(),
                     mx.access_token.clone(),
+                    // "" sentinel = no specific room (join logic handles "allow all")
                     mx.allowed_rooms.first().cloned().unwrap_or_default(),
                     mx.allowed_users.clone(),
                 )))
@@ -4476,6 +4477,7 @@ fn collect_configured_channels(
                     MatrixChannel::new_full(
                         mx.homeserver.clone(),
                         mx.access_token.clone(),
+                        // "" sentinel = no specific room (join logic handles "allow all")
                         mx.allowed_rooms.first().cloned().unwrap_or_default(),
                         mx.allowed_users.clone(),
                         mx.allowed_rooms.clone(),
