@@ -15,6 +15,7 @@ import Doctor from './pages/Doctor';
 import Pairing from './pages/Pairing';
 import Canvas from './pages/Canvas';
 import Skills from './pages/Skills';
+import Sessions from './pages/Sessions';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
@@ -231,6 +232,7 @@ function AppContent() {
           <Route element={<Layout />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/agent" element={<AgentChat />} />
+            <Route path="/sessions" element={<Sessions />} />
             <Route path="/tools" element={<Tools />} />
             <Route path="/cron" element={<Cron />} />
             <Route path="/integrations" element={<Integrations />} />

@@ -227,7 +227,7 @@ export default function SessionPanel({ currentSessionId }: SessionPanelProps) {
                 <button
                   type="button"
                   onClick={(e) => handleDelete(e, session.session_id)}
-                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded-lg shrink-0"
+                  className="p-1 rounded-lg shrink-0"
                   style={{ color: 'var(--pc-text-muted)' }}
                   onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; }}
                   onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}

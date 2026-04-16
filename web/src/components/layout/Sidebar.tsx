@@ -3,6 +3,7 @@ import { basePath } from '../../lib/basePath';
 import {
   LayoutDashboard,
   MessageSquare,
+  List,
   Wrench,
   Clock,
   Puzzle,
@@ -22,6 +23,7 @@ import SessionPanel from '@/components/SessionPanel';
 const navItems = [
   { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
   { to: '/agent', icon: MessageSquare, labelKey: 'nav.agent' },
+  { to: '/sessions', icon: List, labelKey: 'nav.sessions' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
   { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
   { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },

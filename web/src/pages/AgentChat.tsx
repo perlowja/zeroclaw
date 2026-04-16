@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Bot, User, AlertCircle, Copy, Check, Plus } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, Copy, Check, Plus, Search, X, Download, Paperclip, Brain, PanelRightClose, PanelRightOpen } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { useSearchParams } from 'react-router-dom';
 import type { Session, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId, SESSION_STORAGE_KEY } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
@@ -17,6 +18,45 @@ import {
   saveChatHistory,
   uiMessagesToPersisted,
 } from '@/lib/chatHistoryStorage';
+
+// ---------------------------------------------------------------------------
+// Input history — arrow-up/down cycles through past inputs per session
+// ---------------------------------------------------------------------------
+
+class InputHistory {
+  private store = new Map<string, string[]>();
+  private cursor = new Map<string, number>();
+  private maxPerSession = 50;
+
+  push(sessionId: string, text: string) {
+    const arr = this.store.get(sessionId) ?? [];
+    if (arr[arr.length - 1] === text) return; // dedup consecutive
+    arr.push(text);
+    if (arr.length > this.maxPerSession) arr.shift();
+    this.store.set(sessionId, arr);
+    this.cursor.delete(sessionId);
+  }
+
+  prev(sessionId: string): string | undefined {
+    const arr = this.store.get(sessionId);
+    if (!arr?.length) return undefined;
+    const cur = this.cursor.get(sessionId) ?? arr.length;
+    const next = Math.max(0, cur - 1);
+    this.cursor.set(sessionId, next);
+    return arr[next];
+  }
+
+  next(sessionId: string): string | undefined {
+    const arr = this.store.get(sessionId);
+    if (!arr?.length) return undefined;
+    const cur = this.cursor.get(sessionId) ?? arr.length;
+    const next = Math.min(arr.length, cur + 1);
+    this.cursor.set(sessionId, next);
+    return next >= arr.length ? '' : arr[next];
+  }
+}
+
+const inputHistory = new InputHistory();
 
 // ---------------------------------------------------------------------------
 // Model route helpers (folded from ModelSelector component)
@@ -102,8 +142,34 @@ interface ChatMessage {
 const DRAFT_KEY = 'agent-chat';
 
 export default function AgentChat() {
-  const sessionIdRef = useRef(getOrCreateSessionId());
+  const [searchParams, setSearchParams] = useSearchParams();
+  // URL-sync: if ?session= is present, use it as the initial session
+  const initialSessionId = searchParams.get('session') || getOrCreateSessionId();
+  const sessionIdRef = useRef(initialSessionId);
+  // Sync sessionStorage on mount
+  if (sessionStorage.getItem(SESSION_STORAGE_KEY) !== initialSessionId) {
+    sessionStorage.setItem(SESSION_STORAGE_KEY, initialSessionId);
+  }
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
+
+  // Message search state
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Thinking level
+  const [thinkingLevel, setThinkingLevel] = useState<string>('default');
+
+  // File attachments
+  const [attachments, setAttachments] = useState<File[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Split pane sidebar (for tool output / markdown preview)
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarContent, setSidebarContent] = useState<string>('');
+  const [sidebarTitle, setSidebarTitle] = useState<string>('');
+  const [splitRatio, setSplitRatio] = useState(0.6);
+  const splitDragRef = useRef(false);
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     // Synchronously hydrate from localStorage so messages survive tab switches
     // without a flash of empty state. Server hydration may override later.
@@ -174,19 +240,21 @@ export default function AgentChat() {
     return () => window.removeEventListener('zeroclaw-session-change', handler);
   }, [fetchSessions]);
 
-  // --- Session dropdown handler ---
+  // --- Session dropdown handler (with URL sync) ---
   const handleSessionSelect = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     const newSessionId = e.target.value;
     if (newSessionId === sessionIdRef.current) return;
+    setSearchParams({ session: newSessionId }, { replace: true });
     window.dispatchEvent(new CustomEvent('zeroclaw-session-change', { detail: { sessionId: newSessionId } }));
-  }, []);
+  }, [setSearchParams]);
 
-  // --- New chat handler ---
+  // --- New chat handler (with URL sync) ---
   const handleNewChat = useCallback(() => {
     const newId = generateUUID();
     sessionStorage.setItem(SESSION_STORAGE_KEY, newId);
+    setSearchParams({ session: newId }, { replace: true });
     window.dispatchEvent(new CustomEvent('zeroclaw-session-change', { detail: { sessionId: newId } }));
-  }, []);
+  }, [setSearchParams]);
 
   // --- Model select handler ---
   const handleModelSelect = useCallback(async (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -521,6 +589,7 @@ export default function AgentChat() {
     ]);
 
     try {
+      inputHistory.push(sessionIdRef.current, trimmed);
       wsRef.current.sendMessage(trimmed);
       setTyping(true);
       pendingContentRef.current = '';
@@ -541,6 +610,26 @@ export default function AgentChat() {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+      return;
+    }
+    // Input history: arrow up/down when input is empty
+    if (e.key === 'ArrowUp' && !input.trim()) {
+      e.preventDefault();
+      const prev = inputHistory.prev(sessionIdRef.current);
+      if (prev !== undefined) setInput(prev);
+      return;
+    }
+    if (e.key === 'ArrowDown' && !input.trim()) {
+      e.preventDefault();
+      const next = inputHistory.next(sessionIdRef.current);
+      if (next !== undefined) setInput(next);
+      return;
+    }
+    // Cmd/Ctrl+F: open message search
+    if (e.key === 'f' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      setSearchOpen(true);
+      setTimeout(() => searchInputRef.current?.focus(), 50);
     }
   };
 
@@ -597,6 +686,32 @@ export default function AgentChat() {
         </div>
       )}
 
+      {/* Message search bar */}
+      {searchOpen && (
+        <div className="flex items-center gap-2 px-4 py-2 border-b animate-fade-in" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+          <Search className="h-4 w-4 shrink-0" style={{ color: 'var(--pc-text-faint)' }} />
+          <input
+            ref={searchInputRef}
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Escape') { setSearchOpen(false); setSearchQuery(''); } }}
+            placeholder="Search messages..."
+            className="flex-1 text-sm bg-transparent outline-none"
+            style={{ color: 'var(--pc-text-primary)' }}
+          />
+          {searchQuery && (
+            <span className="text-[10px] tabular-nums" style={{ color: 'var(--pc-text-faint)' }}>
+              {messages.filter((m) => m.content.toLowerCase().includes(searchQuery.toLowerCase())).length} matches
+            </span>
+          )}
+          <button onClick={() => { setSearchOpen(false); setSearchQuery(''); }}
+            className="p-1 rounded-lg" style={{ color: 'var(--pc-text-muted)' }}>
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Chat controls row — OpenClaw-style inline session + model selectors */}
       <div className="flex items-center gap-2 px-4 py-2 border-b" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
         {/* Session select */}
@@ -641,6 +756,80 @@ export default function AgentChat() {
           ))}
         </select>
 
+        {/* Thinking level */}
+        <select
+          value={thinkingLevel}
+          onChange={(e) => setThinkingLevel(e.target.value)}
+          className="text-sm rounded-lg px-2 py-1.5 min-w-0 max-w-[140px]"
+          style={{ background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)', color: 'var(--pc-text-primary)' }}
+          title="Thinking level"
+        >
+          <option value="default">Thinking: Default</option>
+          <option value="off">Thinking: Off</option>
+          <option value="minimal">Thinking: Minimal</option>
+          <option value="low">Thinking: Low</option>
+          <option value="medium">Thinking: Medium</option>
+          <option value="high">Thinking: High</option>
+        </select>
+
+        {/* Sidebar toggle */}
+        <button
+          type="button"
+          title={sidebarOpen ? "Close sidebar" : "Open sidebar"}
+          onClick={() => setSidebarOpen(!sidebarOpen)}
+          className="flex items-center justify-center rounded-lg p-1.5 transition-all shrink-0"
+          style={{
+            background: sidebarOpen ? 'var(--pc-accent-glow)' : 'var(--pc-bg-elevated)',
+            border: `1px solid ${sidebarOpen ? 'var(--pc-accent-dim)' : 'var(--pc-border)'}`,
+            color: sidebarOpen ? 'var(--pc-accent)' : 'var(--pc-text-muted)',
+          }}
+        >
+          {sidebarOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
+        </button>
+
+        {/* Search toggle */}
+        <button
+          type="button"
+          title="Search messages (Ctrl+F)"
+          onClick={() => { setSearchOpen(!searchOpen); setTimeout(() => searchInputRef.current?.focus(), 50); }}
+          className="flex items-center justify-center rounded-lg p-1.5 transition-all shrink-0"
+          style={{
+            background: searchOpen ? 'var(--pc-accent-glow)' : 'var(--pc-bg-elevated)',
+            border: `1px solid ${searchOpen ? 'var(--pc-accent-dim)' : 'var(--pc-border)'}`,
+            color: searchOpen ? 'var(--pc-accent)' : 'var(--pc-text-muted)',
+          }}
+        >
+          <Search className="h-4 w-4" />
+        </button>
+
+        {/* Export markdown */}
+        <button
+          type="button"
+          title="Export as Markdown"
+          onClick={() => {
+            const md = messages.map((m) =>
+              `**${m.role === 'user' ? 'User' : 'Agent'}** (${m.timestamp.toLocaleString()}):\n\n${m.content}\n`
+            ).join('\n---\n\n');
+            const blob = new Blob([md], { type: 'text/markdown' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `chat-${sessionIdRef.current.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}.md`;
+            a.click();
+            URL.revokeObjectURL(url);
+          }}
+          className="flex items-center justify-center rounded-lg p-1.5 transition-all shrink-0"
+          style={{
+            background: 'var(--pc-bg-elevated)',
+            border: '1px solid var(--pc-border)',
+            color: 'var(--pc-text-muted)',
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; e.currentTarget.style.color = 'var(--pc-text-primary)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--pc-border)'; e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
+        >
+          <Download className="h-4 w-4" />
+        </button>
+
         {/* New Chat */}
         <button
           type="button"
@@ -665,8 +854,10 @@ export default function AgentChat() {
         </button>
       </div>
 
+      {/* Main content: split pane (messages + optional sidebar) */}
+      <div className="flex-1 flex overflow-hidden">
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="overflow-y-auto p-4 space-y-4" style={{ flex: sidebarOpen ? splitRatio : 1, transition: 'flex 0.2s' }}>
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
             <div className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float" style={{ background: 'var(--pc-accent-glow)' }}>
@@ -677,13 +868,16 @@ export default function AgentChat() {
           </div>
         )}
 
-        {messages.map((msg, idx) => (
+        {messages.map((msg, idx) => {
+          const isSearchMatch = searchQuery && msg.content.toLowerCase().includes(searchQuery.toLowerCase());
+          const dimmed = searchQuery && !isSearchMatch;
+          return (
           <div
             key={msg.id}
             className={`group flex items-start gap-3 ${
               msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
             }`}
-            style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
+            style={{ animationDelay: `${Math.min(idx * 30, 200)}ms`, opacity: dimmed ? 0.3 : 1, transition: 'opacity 0.2s' }}
           >
             <div
               className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
@@ -714,7 +908,15 @@ export default function AgentChat() {
                   </details>
                 )}
                 {msg.toolCall ? (
-                  <ToolCallCard toolCall={msg.toolCall} />
+                  <div className="cursor-pointer" onClick={() => {
+                    if (msg.toolCall?.output) {
+                      setSidebarTitle(`Tool: ${msg.toolCall.name}`);
+                      setSidebarContent(msg.toolCall.output);
+                      setSidebarOpen(true);
+                    }
+                  }}>
+                    <ToolCallCard toolCall={msg.toolCall} />
+                  </div>
                 ) : msg.markdown ? (
                   <div className="text-sm break-words leading-relaxed chat-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
                 ) : (
@@ -741,7 +943,8 @@ export default function AgentChat() {
               </button>
             </div>
           </div>
-        ))}
+          );
+        })}
 
         {typing && (
           <div className="flex items-start gap-3 animate-fade-in">
@@ -771,15 +974,122 @@ export default function AgentChat() {
         <div ref={messagesEndRef} />
       </div>
 
+      {/* Resizable drag handle + Sidebar */}
+      {sidebarOpen && (
+        <>
+          <div
+            className="w-1 cursor-col-resize hover:bg-[var(--pc-accent)] transition-colors shrink-0"
+            style={{ background: 'var(--pc-border)' }}
+            onMouseDown={() => {
+              splitDragRef.current = true;
+              const onMove = (e: MouseEvent) => {
+                if (!splitDragRef.current) return;
+                const container = (e.target as HTMLElement).closest('.flex-1.flex');
+                if (!container) return;
+                const rect = container.getBoundingClientRect();
+                const ratio = Math.max(0.3, Math.min(0.8, (e.clientX - rect.left) / rect.width));
+                setSplitRatio(ratio);
+              };
+              const onUp = () => { splitDragRef.current = false; window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+              window.addEventListener('mousemove', onMove);
+              window.addEventListener('mouseup', onUp);
+            }}
+          />
+          <div className="overflow-y-auto border-l" style={{ flex: 1 - splitRatio, borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+            <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'var(--pc-border)' }}>
+              <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-faint)' }}>
+                {sidebarTitle || 'Details'}
+              </span>
+              <button onClick={() => setSidebarOpen(false)} className="p-1 rounded-lg" style={{ color: 'var(--pc-text-muted)' }}>
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div className="p-4">
+              {sidebarContent ? (
+                <div className="text-sm break-words leading-relaxed chat-markdown">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{sidebarContent}</ReactMarkdown>
+                </div>
+              ) : (
+                <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+                  Click a tool result or message to view details here.
+                </p>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+      </div>{/* end split pane */}
+
       {/* Input area */}
       <div className="border-t p-4" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
-        <div className="flex items-center gap-3 max-w-4xl mx-auto">
+        {/* Attachment preview */}
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2 max-w-4xl mx-auto">
+            {attachments.map((file, i) => (
+              <div key={`${file.name}-${i}`} className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs"
+                style={{ background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)', color: 'var(--pc-text-primary)' }}>
+                <Paperclip className="h-3 w-3" style={{ color: 'var(--pc-text-faint)' }} />
+                <span className="max-w-[120px] truncate">{file.name}</span>
+                <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
+                  {file.size < 1024 ? `${file.size}B` : file.size < 1048576 ? `${(file.size / 1024).toFixed(0)}KB` : `${(file.size / 1048576).toFixed(1)}MB`}
+                </span>
+                <button onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                  className="p-0.5 rounded" style={{ color: 'var(--pc-text-muted)' }}>
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 max-w-4xl mx-auto">
+          {/* Attach file button */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files) {
+                setAttachments((prev) => [...prev, ...Array.from(e.target.files!)]);
+                e.target.value = '';
+              }
+            }}
+          />
+          <button
+            type="button"
+            title="Attach file"
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center justify-center rounded-2xl p-2.5 transition-all shrink-0"
+            style={{ background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)', color: 'var(--pc-text-muted)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; e.currentTarget.style.color = 'var(--pc-text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--pc-border)'; e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
+          >
+            <Paperclip className="h-4 w-4" />
+          </button>
+
           <textarea
             ref={inputRef}
             rows={1}
             value={input}
             onChange={handleTextareaChange}
             onKeyDown={handleKeyDown}
+            onPaste={(e) => {
+              // Handle pasted images
+              const items = e.clipboardData?.items;
+              if (!items) return;
+              const files: File[] = [];
+              for (const item of Array.from(items)) {
+                if (item.kind === 'file') {
+                  const file = item.getAsFile();
+                  if (file) files.push(file);
+                }
+              }
+              if (files.length > 0) {
+                e.preventDefault();
+                setAttachments((prev) => [...prev, ...files]);
+              }
+            }}
             placeholder={connected ? t('agent.type_message') : t('agent.connecting')}
             disabled={!connected}
             className="input-electric flex-1 px-4 text-sm resize-none disabled:opacity-40"
@@ -788,7 +1098,7 @@ export default function AgentChat() {
           <button
             type='button'
             onClick={handleSend}
-            disabled={!connected || !input.trim()}
+            disabled={!connected || (!input.trim() && attachments.length === 0)}
             className="btn-electric flex-shrink-0 rounded-2xl flex items-center justify-center"
             style={{ color: 'white', width: '40px', height: '40px' }}
           >
