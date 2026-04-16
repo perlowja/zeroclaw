@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Bot, User, AlertCircle, Copy, Check, Plus, Search, X, Download, Paperclip, Brain, PanelRightClose, PanelRightOpen } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, Copy, Check, Plus, Search, X, Download, Paperclip, Brain, PanelRightClose, PanelRightOpen, Mic, MicOff, Pin, PinOff } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useSearchParams } from 'react-router-dom';
@@ -137,6 +137,7 @@ interface ChatMessage {
   markdown?: boolean;
   toolCall?: ToolCallInfo;
   timestamp: Date;
+  pinned?: boolean;
 }
 
 const DRAFT_KEY = 'agent-chat';
@@ -170,6 +171,21 @@ export default function AgentChat() {
   const [sidebarTitle, setSidebarTitle] = useState<string>('');
   const [splitRatio, setSplitRatio] = useState(0.6);
   const splitDragRef = useRef(false);
+
+  // Voice input (Web Speech API)
+  const [voiceActive, setVoiceActive] = useState(false);
+  const [voiceSupported] = useState(() =>
+    typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)
+  );
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+
+  // Pinned messages
+  const [showPinned, setShowPinned] = useState(false);
+
+  // Per-session model override (stored locally, keyed by session)
+  const [sessionModelOverrides, setSessionModelOverrides] = useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem('nclawzero-model-overrides') ?? '{}'); } catch { return {}; }
+  });
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     // Synchronously hydrate from localStorage so messages survive tab switches
     // without a flash of empty state. Server hydration may override later.
@@ -676,6 +692,88 @@ export default function AgentChat() {
     }
   }
 
+  // --- Voice input handlers ---
+  const startVoice = useCallback(() => {
+    if (!voiceSupported) return;
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+
+    let finalTranscript = '';
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      let interim = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript + ' ';
+        } else {
+          interim += event.results[i][0].transcript;
+        }
+      }
+      setInput((prev) => {
+        const base = prev.replace(/\u200B.*$/, ''); // strip previous interim
+        return finalTranscript + (interim ? '\u200B' + interim : '');
+      });
+    };
+    recognition.onerror = () => { setVoiceActive(false); };
+    recognition.onend = () => {
+      setVoiceActive(false);
+      // Finalize: strip interim marker
+      setInput((prev) => prev.replace(/\u200B/g, ''));
+    };
+
+    recognition.start();
+    recognitionRef.current = recognition;
+    setVoiceActive(true);
+  }, [voiceSupported]);
+
+  const stopVoice = useCallback(() => {
+    recognitionRef.current?.stop();
+    setVoiceActive(false);
+  }, []);
+
+  // --- Pin/unpin message ---
+  const togglePin = useCallback((msgId: string) => {
+    setMessages((prev) => prev.map((m) =>
+      m.id === msgId ? { ...m, pinned: !m.pinned } : m
+    ));
+  }, []);
+
+  // --- Per-session model override ---
+  const currentSessionModel = sessionModelOverrides[sessionIdRef.current] || '';
+
+  const handleSessionModelOverride = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = e.target.value;
+    setSessionModelOverrides((prev) => {
+      const next = { ...prev };
+      if (value) {
+        next[sessionIdRef.current] = value;
+      } else {
+        delete next[sessionIdRef.current];
+      }
+      localStorage.setItem('nclawzero-model-overrides', JSON.stringify(next));
+      return next;
+    });
+    // Also apply to the global config (same as existing model select)
+    if (value) {
+      const [provider, ...modelParts] = value.split('/');
+      const model = modelParts.join('/');
+      if (provider && model) {
+        setSwitchingModel(true);
+        getConfig().then((configToml) => {
+          const updated = updateDefaultModel(configToml, provider, model);
+          return putConfig(updated);
+        }).then(() => {
+          setCurrentProvider(value.split('/')[0]!);
+          setCurrentModel(value.split('/').slice(1).join('/'));
+        }).finally(() => setSwitchingModel(false));
+      }
+    }
+  }, []);
+
+  const pinnedMessages = messages.filter((m) => m.pinned);
+
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
       {/* Connection status bar */}
@@ -709,6 +807,37 @@ export default function AgentChat() {
             className="p-1 rounded-lg" style={{ color: 'var(--pc-text-muted)' }}>
             <X className="h-3.5 w-3.5" />
           </button>
+        </div>
+      )}
+
+      {/* Pinned messages panel */}
+      {showPinned && pinnedMessages.length > 0 && (
+        <div className="px-4 py-2 border-b animate-fade-in" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-semibold uppercase tracking-wider flex items-center gap-1" style={{ color: 'var(--pc-accent)' }}>
+              <Pin className="h-3 w-3" /> {pinnedMessages.length} Pinned
+            </span>
+            <button onClick={() => setShowPinned(false)} className="p-1 rounded-lg" style={{ color: 'var(--pc-text-muted)' }}>
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <div className="space-y-1 max-h-32 overflow-y-auto">
+            {pinnedMessages.map((m) => (
+              <div key={m.id} className="flex items-center gap-2 text-xs px-2 py-1 rounded-lg cursor-pointer"
+                style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-secondary)' }}
+                onClick={() => {
+                  document.getElementById(`msg-${m.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }}>
+                <span className="font-medium" style={{ color: m.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-text-primary)' }}>
+                  {m.role === 'user' ? 'You' : 'Agent'}:
+                </span>
+                <span className="truncate flex-1">{m.content.slice(0, 80)}</span>
+                <button onClick={(e) => { e.stopPropagation(); togglePin(m.id); }} className="p-0.5 shrink-0" style={{ color: 'var(--pc-text-faint)' }}>
+                  <PinOff className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -771,6 +900,27 @@ export default function AgentChat() {
           <option value="medium">Thinking: Medium</option>
           <option value="high">Thinking: High</option>
         </select>
+
+        {/* Pinned messages toggle */}
+        <button
+          type="button"
+          title={`Pinned messages (${pinnedMessages.length})`}
+          onClick={() => setShowPinned(!showPinned)}
+          className="flex items-center justify-center rounded-lg p-1.5 transition-all shrink-0 relative"
+          style={{
+            background: showPinned ? 'var(--pc-accent-glow)' : 'var(--pc-bg-elevated)',
+            border: `1px solid ${showPinned ? 'var(--pc-accent-dim)' : 'var(--pc-border)'}`,
+            color: showPinned ? 'var(--pc-accent)' : 'var(--pc-text-muted)',
+          }}
+        >
+          <Pin className="h-4 w-4" />
+          {pinnedMessages.length > 0 && (
+            <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full text-[9px] flex items-center justify-center font-bold"
+              style={{ background: 'var(--pc-accent)', color: 'white' }}>
+              {pinnedMessages.length}
+            </span>
+          )}
+        </button>
 
         {/* Sidebar toggle */}
         <button
@@ -874,6 +1024,7 @@ export default function AgentChat() {
           return (
           <div
             key={msg.id}
+            id={`msg-${msg.id}`}
             className={`group flex items-start gap-3 ${
               msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
             }`}
@@ -927,20 +1078,32 @@ export default function AgentChat() {
                   {msg.timestamp.toLocaleTimeString()}
                 </p>
               </div>
-              <button
-                onClick={() => handleCopy(msg.id, msg.content)}
-                aria-label={t('agent.copy_message')}
-                className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-all p-1.5 rounded-xl"
-                style={{ background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)', color: 'var(--pc-text-muted)', }}
-                onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.borderColor = 'var(--pc-border)'; }}
-              >
-                {copiedId === msg.id ? (
-                  <Check className="h-3 w-3" style={{ color: '#34d399' }} />
-                ) : (
-                  <Copy className="h-3 w-3" />
-                )}
-              </button>
+              <div className="absolute top-1 right-1 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-all">
+                <button
+                  onClick={() => togglePin(msg.id)}
+                  aria-label={msg.pinned ? 'Unpin message' : 'Pin message'}
+                  className="p-1.5 rounded-xl"
+                  style={{ background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)', color: msg.pinned ? 'var(--pc-accent)' : 'var(--pc-text-muted)' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-accent)'; e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; }}
+                  onMouseLeave={(e) => { if (!msg.pinned) { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.borderColor = 'var(--pc-border)'; } }}
+                >
+                  {msg.pinned ? <PinOff className="h-3 w-3" /> : <Pin className="h-3 w-3" />}
+                </button>
+                <button
+                  onClick={() => handleCopy(msg.id, msg.content)}
+                  aria-label={t('agent.copy_message')}
+                  className="p-1.5 rounded-xl"
+                  style={{ background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)', color: 'var(--pc-text-muted)' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.borderColor = 'var(--pc-border)'; }}
+                >
+                  {copiedId === msg.id ? (
+                    <Check className="h-3 w-3" style={{ color: '#34d399' }} />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}
+                </button>
+              </div>
             </div>
           </div>
           );
@@ -1067,6 +1230,26 @@ export default function AgentChat() {
           >
             <Paperclip className="h-4 w-4" />
           </button>
+
+          {/* Voice input button */}
+          {voiceSupported && (
+            <button
+              type="button"
+              title={voiceActive ? "Stop recording" : "Voice input"}
+              onClick={voiceActive ? stopVoice : startVoice}
+              className="flex items-center justify-center rounded-2xl p-2.5 transition-all shrink-0"
+              style={{
+                background: voiceActive ? 'rgba(239, 68, 68, 0.15)' : 'var(--pc-bg-elevated)',
+                border: `1px solid ${voiceActive ? 'rgba(239, 68, 68, 0.4)' : 'var(--pc-border)'}`,
+                color: voiceActive ? '#f87171' : 'var(--pc-text-muted)',
+                animation: voiceActive ? 'pulse 1.5s ease-in-out infinite' : 'none',
+              }}
+              onMouseEnter={(e) => { if (!voiceActive) { e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; e.currentTarget.style.color = 'var(--pc-text-primary)'; } }}
+              onMouseLeave={(e) => { if (!voiceActive) { e.currentTarget.style.borderColor = 'var(--pc-border)'; e.currentTarget.style.color = 'var(--pc-text-muted)'; } }}
+            >
+              {voiceActive ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+            </button>
+          )}
 
           <textarea
             ref={inputRef}
