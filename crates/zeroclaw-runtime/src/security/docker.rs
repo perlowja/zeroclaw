@@ -105,10 +105,16 @@ impl Sandbox for DockerSandbox {
 
         // Read-only workspace bind-mount. Same path inside and outside the
         // container so workspace-relative paths resolve identically in both.
+        // --workdir sets the container's CWD to the workspace, so relative-path
+        // script invocations (`python3 script.py`) and CWD-relative I/O
+        // (`open("relative_file.txt")`) resolve correctly inside the sandbox
+        // without callers having to fully-qualify every path.
         if let Some(workspace) = &self.workspace_dir {
             let workspace_str = workspace.to_string_lossy();
             docker_cmd.arg("-v");
             docker_cmd.arg(format!("{workspace_str}:{workspace_str}:ro"));
+            docker_cmd.arg("--workdir");
+            docker_cmd.arg(workspace_str.as_ref());
         }
 
         docker_cmd.arg(&self.image);
@@ -297,6 +303,16 @@ mod tests {
         assert!(
             args.contains(&expected),
             "bind-mount spec must match host-path:container-path:ro form; args={args:?}"
+        );
+        // --workdir must be set to the workspace so relative-path script
+        // invocations resolve correctly inside the sandbox.
+        assert!(
+            args.contains(&"--workdir".to_string()),
+            "must include --workdir flag when workspace is configured; args={args:?}"
+        );
+        assert!(
+            args.contains(&ws_str.to_string()),
+            "--workdir value must equal the workspace path; args={args:?}"
         );
     }
 
