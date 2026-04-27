@@ -2,7 +2,7 @@
 
 Install, update, run as a Windows scheduled task, and uninstall on Windows 10 / 11.
 
-If you’re running WSL2, you can follow the Linux setup instead — `install.sh` runs unchanged under WSL.
+If you’re running WSL2, you can follow the [Linux setup](./linux.md) instead — `install.sh` runs unchanged under WSL.
 
 > **Note on `setup.bat`.** The release `setup.bat` wrapper has known bugs that prevent it from completing on Windows 11 with drives larger than ~2 TB (32-bit overflow in the disk-space pre-flight check) and on shells that strictly parse `if/else` blocks (unescaped parens in an echo). Until those land in a release, the **manual prebuilt** path (Option 1 below) is the recommended install. Building from source (Option 3) also works.
 
@@ -15,7 +15,7 @@ Download the latest Windows release zip, extract `zeroclaw.exe`, and put it on y
 From a PowerShell prompt:
 
 ```powershell
-$ver = '0.7.3'   # current; check https://github.com/zeroclaw-labs/zeroclaw/releases/latest
+$ver = '0.7.3'   # NOTE: hardcoded — bump on each release; check https://github.com/zeroclaw-labs/zeroclaw/releases/latest for current
 $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
 $dst = "$env:USERPROFILE\.zeroclaw\bin"
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
@@ -84,13 +84,19 @@ docker run -d --name zeroclaw `
   -v zeroclaw-data:/zeroclaw-data `
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 
-# Watch the first-run logs — a one-time pairing code is printed
+# Watch the first-run logs
 docker logs -f zeroclaw
 
-# Health check (no auth)
+# Health check (no auth required)
 curl http://localhost:42617/health
 
-# Pair a client (use the code from `docker logs`)
+# (Optional) pair a client. NOTE: the published image defaults to
+# `require_pairing = false`, so by default no pairing code is emitted
+# and `/api/*` accepts requests without auth. To enable pairing,
+# override the config (set `require_pairing = true` in
+# /zeroclaw-data/.zeroclaw/config.toml inside the container) and restart;
+# a one-time code is then printed to stdout on first start, after which
+# clients POST it to `/pair`:
 curl -X POST http://localhost:42617/pair -H 'X-Pairing-Code: <code-from-logs>'
 ```
 
@@ -100,7 +106,7 @@ curl -X POST http://localhost:42617/pair -H 'X-Pairing-Code: <code-from-logs>'
 - **`ENTRYPOINT ["zeroclaw"]`**, `CMD ["daemon"]` — running with no args starts the daemon and gateway
 - **`EXPOSE 42617`** — both the daemon and gateway listen on this port
 - **Data dir:** `/zeroclaw-data` (config: `/zeroclaw-data/.zeroclaw/config.toml`, workspace: `/zeroclaw-data/workspace`). Mount a named volume or bind here for persistence — note this is **not** `/root/.zeroclaw`.
-- **Pairing:** the daemon prints a one-time pairing code to stdout on first start; clients POST to `/pair` with that code in the `X-Pairing-Code` header before any authenticated endpoint will respond.
+- **Pairing:** the published image defaults to `require_pairing = false`, so `/api/*` accepts requests without authentication out-of-the-box. When pairing is enabled (set `require_pairing = true` in `/zeroclaw-data/.zeroclaw/config.toml` and restart), the daemon prints a one-time code to stdout on first start, and clients then POST it to `/pair` with the `X-Pairing-Code` header before any authenticated endpoint will respond.
 - **Web dashboard:** disabled by default in the published image. To enable, build the frontend (`cd web && npm ci && npm run build`) and set `gateway.web_dist_dir` in config or `ZEROCLAW_WEB_DIST_DIR` env.
 
 Build from source against the bundled Dockerfile:
@@ -113,7 +119,7 @@ docker build -t zeroclaw:local -f Dockerfile.debian .
 
 **Verified on Windows + Docker:**
 
-- **Container behaviour matches Linux.** Pulled and ran `ghcr.io/zeroclaw-labs/zeroclaw:latest` in WSL Debian on Windows 11 build 26200.8313. Image starts cleanly, gateway listens on `:42617`, `/health` returns valid JSON, pairing-code flow works.
+- **Container behaviour matches Linux.** Pulled and ran `ghcr.io/zeroclaw-labs/zeroclaw:latest` in WSL Debian on Windows 11 build 26200.8313. Image starts cleanly, gateway listens on `:42617`, `/health` returns valid JSON. With `require_pairing = true` set in config and the container restarted, the pairing-code flow on `/pair` also works as documented.
 - **Docker without Docker Desktop.** `wsl --install` to enable WSL2, then `sudo apt install docker.io` inside the WSL distro, gives you the daemon directly — verified pulls and runs the published image without modification.
 
 **Host-side best practices** — general Docker + WSL2 guidance, not zeroclaw-specific runtime claims. Sourced from Microsoft Learn and Docker’s own docs where applicable:
@@ -127,7 +133,9 @@ docker build -t zeroclaw:local -f Dockerfile.debian .
 - **Daemon under Docker, not Task Scheduler.** Inside the container there is no Windows Task Scheduler. Use Docker’s [restart policy](https://docs.docker.com/engine/containers/start-containers-automatically/) — `--restart=unless-stopped` as in the example above — for daemon-mode startup. The published image runs as PID 1 / nonroot user; the container *is* the service — don’t run `zeroclaw service install` inside it.
 - **Skill sandbox via host Docker socket.** ZeroClaw’s skill-execution sandbox can shell out to Docker. If you’re running ZeroClaw itself in a container and want skill sandboxing to also use Docker, mount the host Docker socket so child containers run on the host daemon rather than nesting Docker-in-Docker:
   ```
-  -v //var/run/docker.sock:/var/run/docker.sock
+  # PowerShell / cmd.exe: use a single leading slash.
+  # Git Bash / MINGW: use //var/run/docker.sock to bypass MSYS path rewriting.
+  -v /var/run/docker.sock:/var/run/docker.sock
   ```
   Be aware that mounting the Docker socket grants root-equivalent host access to anything inside the container — Docker’s [Protect the Docker daemon socket](https://docs.docker.com/engine/security/protect-access/) page covers the trade-off. On Docker Desktop for Windows, the host socket is `\\.\pipe\docker_engine`; the bind-mount syntax above translates correctly. The pattern is general; it has not been benchmarked specifically against zeroclaw’s skill sandbox in this doc.
 - **Resource limits.** Docker Desktop on Windows allocates RAM/CPU via `%USERPROFILE%\.wslconfig`, which defaults to half host RAM. The full configuration surface is documented in Microsoft’s [Advanced settings configuration in WSL](https://learn.microsoft.com/en-us/windows/wsl/wsl-config) reference. A reasonable starting envelope for a single-user ZeroClaw deployment is:
