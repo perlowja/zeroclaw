@@ -22,23 +22,30 @@ impl Channel for WasmChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        // TODO: Wire to WASM plugin send function
-        tracing::warn!(
-            "WasmChannel '{}' (plugin: {}) send not yet connected: {}",
+        // Previously returned Ok(()) after a warn-log — plugin-backed
+        // channels appeared operational while silently dropping every
+        // outbound message. Return a hard error so plugin-channel
+        // integrations FAIL LOUDLY until a real WASM bridge lands —
+        // matches WasmTool::execute which already returns success=false
+        // with an explicit unimplemented marker.
+        anyhow::bail!(
+            "WasmChannel '{}' (plugin: {}) send is not implemented. Message dropped: {}",
             self.name,
             self.plugin_name,
             message.content
-        );
-        Ok(())
+        )
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        // TODO: Wire to WASM plugin receive/listen function
-        tracing::warn!(
-            "WasmChannel '{}' (plugin: {}) listen not yet connected",
+        // Previously returned Ok(()) — listen() appeared to succeed but
+        // never bound the WASM receive callback, so no inbound message
+        // would ever flow through. Return a hard error so callers see
+        // the missing runtime instead of waiting indefinitely on an
+        // empty channel.
+        anyhow::bail!(
+            "WasmChannel '{}' (plugin: {}) listen is not implemented; channel will not receive messages",
             self.name,
             self.plugin_name,
-        );
-        Ok(())
+        )
     }
 }
