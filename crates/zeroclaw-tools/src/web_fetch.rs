@@ -62,6 +62,15 @@ impl WebFetchTool {
     }
 
     fn truncate_response(&self, text: &str) -> String {
+        // max_response_size == 0 means "unlimited" (matches the
+        // http_request tool's documented semantics + tests at
+        // crates/zeroclaw-tools/src/http_request.rs:151). Without this
+        // branch, the unsigned-arithmetic path below would truncate
+        // every response to zero bytes, then append the truncation
+        // marker — useless content + spurious Firecrawl fallback.
+        if self.max_response_size == 0 {
+            return text.to_string();
+        }
         if text.len() > self.max_response_size {
             let mut truncated = text
                 .chars()
@@ -79,7 +88,16 @@ impl WebFetchTool {
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
         let mut bytes_stream = response.bytes_stream();
-        let hard_cap = self.max_response_size.saturating_add(1);
+        // max_response_size == 0 → unlimited. Without this branch, the
+        // existing saturating_add(1) made hard_cap = 1 byte, so the
+        // entire stream was truncated after one byte. Use usize::MAX as
+        // the effective hard_cap when unlimited so append_chunk_with_cap
+        // never stops early on size grounds.
+        let hard_cap = if self.max_response_size == 0 {
+            usize::MAX
+        } else {
+            self.max_response_size.saturating_add(1)
+        };
         let mut bytes = Vec::new();
 
         while let Some(chunk_result) = bytes_stream.next().await {
