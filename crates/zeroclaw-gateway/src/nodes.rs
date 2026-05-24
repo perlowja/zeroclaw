@@ -234,8 +234,29 @@ pub async fn handle_ws_nodes(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Auth: check node auth token if configured
+    // /ws/nodes is always wired on the router (no per-route disable
+    // hook), so the only gate available here is at request time.
+    // Previously nodes.enabled was only used for printing the route in
+    // the startup banner — a configuration with nodes.enabled=false
+    // still served /ws/nodes. Reject 404 when disabled so the route
+    // is effectively absent from the API surface.
     let nodes_config = state.config.lock().nodes.clone();
+    if !nodes_config.enabled {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            "Not Found — node discovery is disabled (set nodes.enabled=true to enable)",
+        )
+            .into_response();
+    }
+
+    // Auth posture (with nodes.enabled=true):
+    //   * If nodes.auth_token is set, callers MUST present it.
+    //   * If nodes.auth_token is absent, fall back to pairing auth.
+    //   * If BOTH are absent (no token + pairing disabled), reject
+    //     with a clear configuration error so an operator can't
+    //     accidentally leave node registration entirely
+    //     unauthenticated — previously this exact combination allowed
+    //     arbitrary clients to register dynamic capabilities.
     if let Some(ref expected_token) = nodes_config.auth_token {
         let token = extract_node_ws_token(&headers, params.token.as_deref()).unwrap_or("");
         if token != expected_token {
@@ -245,10 +266,7 @@ pub async fn handle_ws_nodes(
             )
                 .into_response();
         }
-    }
-
-    // Fall back to pairing auth if no node-specific token
-    if nodes_config.auth_token.is_none() && state.pairing.require_pairing() {
+    } else if state.pairing.require_pairing() {
         let token = extract_node_ws_token(&headers, params.token.as_deref()).unwrap_or("");
         if !state.pairing.is_authenticated(token) {
             return (
@@ -257,6 +275,18 @@ pub async fn handle_ws_nodes(
             )
                 .into_response();
         }
+    } else {
+        // nodes.enabled=true, no node auth_token, pairing disabled.
+        // Refuse to register any node — this combination would
+        // otherwise allow arbitrary unauthenticated clients to claim
+        // node capabilities. Operator must EITHER set
+        // nodes.auth_token OR enable gateway.require_pairing.
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable — node registration is disabled because no auth method is configured. \
+             Set nodes.auth_token OR enable gateway.require_pairing.",
+        )
+            .into_response();
     }
 
     // Echo sub-protocol if client requests it
