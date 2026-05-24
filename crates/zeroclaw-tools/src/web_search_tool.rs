@@ -424,9 +424,30 @@ impl Tool for WebSearchTool {
         }
 
         let result = match resolution.route {
-            WebSearchProviderRoute::DuckDuckGo | WebSearchProviderRoute::Tavily => {
-                self.search_duckduckgo(query).await?
-            } // TODO: implement Tavily search
+            WebSearchProviderRoute::DuckDuckGo => self.search_duckduckgo(query).await?,
+            // Tavily backend isn't implemented. Previously the route
+            // collapsed to DuckDuckGo silently — users selecting
+            // "tavily" got DuckDuckGo results without any indication
+            // the configured provider was being ignored. Return an
+            // explicit unsupported-provider error so callers can
+            // either switch providers or configure DuckDuckGo
+            // intentionally. See codex audit
+            // ncz-os-zeroclaw:tavily-search-unimplemented (2026-05-23).
+            WebSearchProviderRoute::Tavily => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Tavily web search is not implemented. The Tavily \
+                         provider is accepted by config but no backend is \
+                         wired up; previously this silently routed to \
+                         DuckDuckGo, hiding the misconfiguration. Switch \
+                         to duckduckgo, brave, or searxng — or open an \
+                         issue requesting Tavily implementation."
+                            .to_string(),
+                    ),
+                });
+            }
             WebSearchProviderRoute::Brave => self.search_brave(query).await?,
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
         };
