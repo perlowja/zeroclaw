@@ -1066,6 +1066,46 @@ mod tests {
     }
 
     #[test]
+    fn truncate_response_zero_means_unlimited() {
+        // max_response_size == 0 must be treated as unlimited — no truncation
+        // marker, full text returned regardless of length.
+        let tool = WebFetchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            vec![],
+            0, // unlimited
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+        );
+        let long_text = "x".repeat(10_000);
+        let result = tool.truncate_response(&long_text);
+        assert_eq!(result.len(), 10_000, "zero limit must not truncate");
+        assert!(!result.contains("[Response truncated"), "must not append truncation marker");
+    }
+
+    #[test]
+    fn read_response_text_limited_zero_means_unlimited() {
+        // When max_response_size == 0, read_response_text_limited must not
+        // stop streaming after 1 byte (the old saturating_add(1) bug that
+        // caused short output and triggered spurious Firecrawl fallback).
+        let tool = WebFetchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            vec![],
+            0, // unlimited
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+        );
+        // Build a body well above FIRECRAWL_MIN_BODY_LEN (100 bytes).
+        let body = "a".repeat(500);
+        let result = tool.truncate_response(&body);
+        assert_eq!(result.len(), 500, "zero limit must return full body");
+        assert!(!result.contains("[Response truncated"), "must not truncate");
+    }
+
+    #[test]
     fn truncate_over_limit() {
         let tool = WebFetchTool::new(
             Arc::new(SecurityPolicy::default()),
