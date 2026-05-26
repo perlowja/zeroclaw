@@ -1081,7 +1081,10 @@ mod tests {
         let long_text = "x".repeat(10_000);
         let result = tool.truncate_response(&long_text);
         assert_eq!(result.len(), 10_000, "zero limit must not truncate");
-        assert!(!result.contains("[Response truncated"), "must not append truncation marker");
+        assert!(
+            !result.contains("[Response truncated"),
+            "must not append truncation marker"
+        );
     }
 
     #[test]
