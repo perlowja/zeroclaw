@@ -1087,25 +1087,81 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_response_text_limited_zero_means_unlimited() {
-        // When max_response_size == 0, read_response_text_limited must not
-        // stop streaming after 1 byte (the old saturating_add(1) bug that
-        // caused short output and triggered spurious Firecrawl fallback).
+    /// Drives the actual streamed-read path (standard_fetch +
+    /// read_response_text_limited) via wiremock to lock in the
+    /// max_response_size=0 behaviour. Audacity88 review (PR #6884)
+    /// flagged the direct-helper test as insufficient because it
+    /// did not exercise the saturating_add(1) cap that previously
+    /// stopped streaming after 1 byte and triggered spurious
+    /// Firecrawl fallback.
+    #[tokio::test]
+    async fn standard_fetch_with_zero_limit_returns_full_body_and_skips_firecrawl_fallback() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+
+        // Body must exceed FIRECRAWL_MIN_BODY_LEN (100 bytes) so any
+        // truncation to <100 bytes would (incorrectly) trigger fallback.
+        let body = "a".repeat(500);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+
         let tool = WebFetchTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            vec!["*".into()],
             vec![],
-            0, // unlimited
+            0, // max_response_size = unlimited
             30,
-            FirecrawlConfig::default(),
+            FirecrawlConfig {
+                enabled: true,
+                ..FirecrawlConfig::default()
+            },
             vec![],
         );
-        // Build a body well above FIRECRAWL_MIN_BODY_LEN (100 bytes).
-        let body = "a".repeat(500);
-        let result = tool.truncate_response(&body);
-        assert_eq!(result.len(), 500, "zero limit must return full body");
-        assert!(!result.contains("[Response truncated"), "must not truncate");
+
+        // Bypass SSRF-guarded execute() — call standard_fetch directly so
+        // wiremock on 127.0.0.1 is reachable.
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let standard_result = tool.standard_fetch(&client, &url).await;
+
+        // (a) standard result IS the full body — proves streamed read did
+        // not stop after 1 byte under the zero-limit path.
+        assert!(
+            standard_result.success,
+            "standard_fetch must succeed, got error={:?}",
+            standard_result.error
+        );
+        assert_eq!(
+            standard_result.output.len(),
+            body.len(),
+            "streamed body length under zero-limit must equal full body"
+        );
+        assert_eq!(
+            standard_result.output, body,
+            "streamed body content must equal full body"
+        );
+        assert!(
+            !standard_result.output.contains("[Response truncated"),
+            "must not append truncation marker under zero limit"
+        );
+
+        // (b) result does NOT trip should_fallback_to_firecrawl — proves
+        // the regression (1-byte short body) is locked out.
+        assert!(
+            !tool.should_fallback_to_firecrawl(&standard_result),
+            "500-byte body under zero limit must not trigger Firecrawl fallback"
+        );
     }
 
     #[test]
