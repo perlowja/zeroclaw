@@ -78,15 +78,18 @@ zeroclaw auth status
 
 Because `zeroclaw service install` has no FreeBSD backend, supervise the daemon with FreeBSD's native [`daemon(8)`](https://man.freebsd.org/cgi/man.cgi?daemon%288%29) under an `rc.d` script. This gives you `service zeroclaw start|stop|restart|status`, restart-on-crash, a pidfile, and boot-time startup.
 
+> **Ready-to-install copies of every script below live in [`dist/freebsd/`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/dist/freebsd)** (`zeroclaw-run.sh`, the basic `zeroclaw.rc`, and the hardened `zeroclaw-hardened.rc`). The two `rc.d` scripts carry a `@@ZEROCLAW_USER@@` placeholder you `sed` in on install, so you can grab the files instead of copy-pasting — see `dist/freebsd/README.md`. The walkthrough below explains what each piece does.
+
 ### 1. Launcher script
 
-`daemon(8)` starts the child with a minimal environment, so export `HOME` and a full `PATH` (FreeBSD puts `git`, `python3`, etc. under `/usr/local/bin`, which is *not* on the default service `PATH`). Save as `/usr/local/libexec/zeroclaw-run.sh`:
+`daemon(8)` starts the child with a minimal environment, so export a full `PATH` (FreeBSD puts `git`, `python3`, etc. under `/usr/local/bin`, which is *not* on the default service `PATH`). The `rc.d` script runs this through `daemon -u <user>`, so the launcher already executes as the service account — derive `HOME` from that account's passwd entry rather than hardcoding `/home/<user>`, so accounts whose home is elsewhere (and `rc.conf` run-as overrides) keep working. Save as `/usr/local/libexec/zeroclaw-run.sh`:
 
 ```sh
 #!/bin/sh
-export HOME=/home/youruser
-export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:/home/youruser/bin
-exec /usr/local/bin/zeroclaw daemon --config-dir "$HOME/.zeroclaw"
+: "${HOME:=$(eval echo ~)}"
+export HOME
+export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/bin"
+exec /usr/local/bin/zeroclaw daemon --config-dir "${HOME}/.zeroclaw"
 ```
 
 ```sh
@@ -112,7 +115,9 @@ rcvar="zeroclaw_enable"
 load_rc_config $name
 
 : ${zeroclaw_enable:="NO"}
-: ${zeroclaw_user:="youruser"}
+# Do NOT name this ${name}_user — rc.subr would then run its own su user-switch
+# and collide with daemon -u ("failed to set user environment").
+: ${zeroclaw_runas:="youruser"}
 
 rundir="/var/run/zeroclaw"
 pidfile="${rundir}/zeroclaw.pid"
@@ -120,14 +125,17 @@ logfile="/var/log/${name}.log"
 launcher="/usr/local/libexec/zeroclaw-run.sh"
 
 command="/usr/sbin/daemon"
-command_args="-r -P ${pidfile} -o ${logfile} -u ${zeroclaw_user} ${launcher}"
+command_args="-r -P ${pidfile} -o ${logfile} -u ${zeroclaw_runas} ${launcher}"
 
 start_precmd="zeroclaw_precmd"
 
 zeroclaw_precmd()
 {
-    install -d -o ${zeroclaw_user} -g wheel -m 755 "${rundir}"
-    install -o ${zeroclaw_user} -m 640 /dev/null "${logfile}"
+    # rundir + logfile stay root-owned: rc.d (root) writes the daemon -P pidfile
+    # here and trusts it later, so the unprivileged service user must not be able
+    # to forge it. daemon -o opens the logfile before dropping to ${zeroclaw_runas}.
+    install -d -o root -g wheel -m 755 "${rundir}"
+    install -o root -g wheel -m 640 /dev/null "${logfile}"
 }
 
 run_rc_command "$1"
@@ -142,7 +150,7 @@ What the flags do:
 - `-r` — supervise and restart the child if it exits (crash recovery).
 - `-P ${pidfile}` — write the *supervisor's* pid so `service zeroclaw stop` can signal it.
 - `-o ${logfile}` — redirect the child's stdout/stderr to a logfile.
-- `-u ${zeroclaw_user}` — run zeroclaw as an unprivileged user, not root.
+- `-u ${zeroclaw_runas}` — run zeroclaw as an unprivileged user, not root.
 
 > **Why `daemon -u` and not `su -m`.** A common pattern is `daemon ... su -m user -c launcher`. Avoid it: `su(1)` does **not** forward `SIGTERM` to its child, so `service zeroclaw stop` kills the `daemon` supervisor but leaves an orphaned `zeroclaw` process behind — and the next `start` stacks a second copy. `daemon -u user` makes `daemon(8)` the direct parent of `zeroclaw`, so it forwards the stop signal and shuts down cleanly. (If you're stuck with a `su`-based script for other reasons, add a `pkill -f "zeroclaw daemon"` sweep to its stop path.)
 
@@ -150,7 +158,7 @@ What the flags do:
 
 ```sh
 doas sysrc zeroclaw_enable=YES
-doas sysrc zeroclaw_user=youruser      # the account that owns ~/.zeroclaw
+doas sysrc zeroclaw_runas=youruser     # the account that owns ~/.zeroclaw
 
 doas service zeroclaw start
 doas service zeroclaw status
@@ -160,12 +168,12 @@ doas service zeroclaw status
 
 ### 4. Hardening for unattended and remote operation
 
-The script above is correct for an interactive, single-instance install. Three `daemon(8)` behaviours will surprise you the moment you drive the service remotely (over `ssh`) or run more than one copy. All three bit a production deployment; the fixes are small.
+The script above is correct for an interactive, single-instance install. Three `daemon(8)` behaviours will surprise you the moment you drive the service remotely (over `ssh`) or run more than one copy. All three bit a production deployment; the fixes are small. A complete script folding in every fix below ships as [`dist/freebsd/zeroclaw-hardened.rc`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/dist/freebsd) — install it in place of the basic `zeroclaw` script.
 
 **Remote `service ... start` hangs.** `daemon -r` inherits and holds open whatever stdin/stdout/stderr it was launched with. Run `ssh host 'service zeroclaw start'` and the supervisor keeps your `ssh` session's stdout fd open forever, so `ssh` never sees EOF and the command hangs even though the daemon started fine. Detach the supervisor's own descriptors — `-o ${logfile}` already routes the *child's* output, so nothing is lost:
 
 ```sh
-command_args="-r -P ${pidfile} -o ${logfile} -u ${zeroclaw_user} ${launcher}"
+command_args="-r -P ${pidfile} -o ${logfile} -u ${zeroclaw_runas} ${launcher}"
 # ...invoke daemon with its own std{in,out,err} sent to /dev/null:
 /usr/sbin/daemon ${command_args} </dev/null >/dev/null 2>&1
 ```
@@ -174,11 +182,11 @@ If you use the stock `command`/`command_args` form, wrap the start in a custom `
 
 **Repeated `start` stacks orphan supervisors.** A plain `start` does not check whether a supervisor is already running, so a second `start` (or a `start` after a crash that left a stale pidfile) launches another `daemon` that fights the first over the gateway port. Make `start` idempotent by refusing when a live supervisor already exists. Match the supervisor by the launcher path, **not** the pidfile alone (the pidfile can be stale). Two FreeBSD-specific traps when you do this:
 
-- `daemon(8)` *retitles its supervisor* to `daemon: /usr/local/libexec/zeroclaw-run.sh[<childpid>] (daemon)`. So `pgrep -f zeroclaw-run.sh` matches the supervisor, but a `pgrep -f` for the binary name does not. Bind on the literal `daemon: ` prefix — that matches the supervisor and never the child, a hand-run of the launcher, or the rc shell itself.
-- FreeBSD `pgrep -f` does **not** honour a leading `^` anchor against that retitle string — `pgrep -f '^daemon: ...'` matches nothing. Drop the `^`; rely on the `daemon: ` prefix for specificity and escape the dot in `.sh` as `[.]` so it is literal.
+- `daemon(8)` *retitles its supervisor* to `daemon: /usr/local/libexec/zeroclaw-run.sh[<childpid>] (daemon)`. So `pgrep -f zeroclaw-run.sh` matches the supervisor, but a `pgrep -f` for the binary name does not. Bind on the literal `daemon:` prefix — that matches the supervisor and never the child, a hand-run of the launcher, or the rc shell itself. Bind the trailing `[` that opens daemon's `[<childpid>]` too, so a sibling launcher whose name merely *starts with* `zeroclaw-run.sh` can't match (this matters once you run a pool — see [Running a pool of instances](#4-hardening-for-unattended-and-remote-operation) below).
+- FreeBSD `pgrep -f` does **not** honour a leading `^` anchor against that retitle string — `pgrep -f '^daemon: ...'` matches nothing. Drop the `^`; rely on the `daemon:` prefix for specificity and escape the dot in `.sh` as `[.]` (and the bracket as `[[]`) so they are literal.
 
 ```sh
-launcher_pat="daemon: /usr/local/libexec/zeroclaw-run[.]sh"
+launcher_pat="daemon: /usr/local/libexec/zeroclaw-run[.]sh[[]"
 
 zeroclaw_running()
 {
@@ -197,6 +205,70 @@ esac
 ```
 
 **Running a pool of instances.** To run N daemons (e.g. a worker pool), give each its own pidfile and logfile (`worker.$i.pid`, `worker.$i.log`) and loop the start/stop over `$i`. Because the supervisor retitle is identical for every instance and does not include per-instance arguments, the **pidfile is the only per-instance handle** — drive stop/status from the pidfile, and on a full stop sweep any leftover supervisor that no live pidfile points at (started by hand, or whose pidfile went stale).
+
+## Running in a jail
+
+[Jails](https://docs.freebsd.org/en/books/handbook/jails/) give ZeroClaw an isolated root with its own packages, service user, and optionally its own IP — useful if the host runs other services or you want to constrain the agent. **The service setup is identical to the host case; you just run it *inside* the jail.** This walks through a classic thick jail with base-system tooling (no jail manager required).
+
+### 1. Create the jail
+
+```sh
+# ZFS dataset for the jail (use a plain directory if you're on UFS).
+doas zfs create -o mountpoint=/jails/zeroclaw zroot/jails/zeroclaw   # adjust pool
+
+# Extract a base matching the HOST's release into it.
+doas fetch -o /tmp/base.txz \
+    "https://download.freebsd.org/releases/$(uname -m)/$(freebsd-version -u)/base.txz"
+doas tar -xpf /tmp/base.txz -C /jails/zeroclaw
+doas cp /etc/resolv.conf /jails/zeroclaw/etc/
+```
+
+### 2. Configure and start
+
+Add a jail entry to `/etc/jail.conf` (host side). This example shares the host network; set `ip4.addr` instead if you give the jail a dedicated address.
+
+```
+zeroclaw {
+    host.hostname = "zeroclaw";
+    path = "/jails/zeroclaw";
+    exec.start = "/bin/sh /etc/rc";
+    exec.stop  = "/bin/sh /etc/rc.shutdown";
+    exec.clean;
+    mount.devfs;
+    persist;
+}
+```
+
+```sh
+doas sysrc jail_enable=YES
+doas sysrc jail_list+=" zeroclaw"
+doas service jail start zeroclaw
+```
+
+### 3. Install ZeroClaw inside the jail
+
+Everything from the sections above runs *inside* the jail — prefix commands with `doas jexec zeroclaw …`, or open a shell with `doas jexec zeroclaw /bin/sh`:
+
+```sh
+doas jexec zeroclaw pkg install -y rust git     # or copy a binary built on the host
+# build + install zeroclaw to /usr/local/bin/zeroclaw exactly as above, then:
+doas jexec zeroclaw pw useradd zeroclaw -m -s /usr/sbin/nologin
+```
+
+Install the launcher and `rc.d` script into the **jail's** filesystem (from the host, the jail root is prefixed: `/jails/zeroclaw/usr/local/libexec/…` and `/jails/zeroclaw/usr/local/etc/rc.d/…`). Then enable and start the service *inside* the jail:
+
+```sh
+doas jexec zeroclaw sysrc zeroclaw_enable=YES
+doas jexec zeroclaw service zeroclaw start
+doas jexec zeroclaw service zeroclaw status
+```
+
+### Jail-specific notes
+
+- **Edit jail files from the host with `tee`, not `cp /dev/stdin`.** Pipe through `… | doas tee /jails/zeroclaw/usr/local/etc/rc.d/zeroclaw >/dev/null`; `doas cp /dev/stdin …` can fail mid-copy with `cp: /dev/stdin: File changed`.
+- **The gateway binds inside the jail.** The daemon listens on loopback by default — to reach it from the host or LAN, launch zeroclaw with `--host 0.0.0.0` (edit `zeroclaw-run.sh`) and give the jail a reachable address, or proxy from the host.
+- **Prefer the hardened `rc.d` script in a jail.** You'll typically drive `service` non-interactively via `jexec`/`ssh`, which is exactly where the basic script's `start` hang and orphan-stacking bite — see [Hardening](#4-hardening-for-unattended-and-remote-operation). It also keeps `/var/run/zeroclaw` root-owned inside the jail so the unprivileged service user can't forge the supervisor pidfile.
+- **Running several daemons in one jail** (e.g. a worker pool) follows the pool note in the hardening section: one pidfile/logfile per instance and a `pgrep` bound to the launcher retitle, since the jail shares one process table.
 
 ## Logs
 
