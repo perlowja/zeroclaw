@@ -7,6 +7,10 @@ ZeroClaw runs natively on FreeBSD (tested on FreeBSD 15.0-RELEASE, `amd64`). Two
 
 Everything else — config, providers, channels, the daemon, the gateway — is identical to any other platform.
 
+> **When to use FreeBSD.** FreeBSD deployments are common in network-appliance, embedded, and jail-based hosting where operators want the base system’s stability, ZFS + jail primitives, or need FreeBSD for policy/licensing reasons. Because there is no prebuilt binary and the `rc.d` setup is manual, this path suits operators comfortable with FreeBSD conventions. If you are only evaluating platforms with no specific FreeBSD requirement, Linux (systemd) or macOS (launchd) onboard faster via `install.sh` and `zeroclaw service install`.
+>
+> **Grab the files instead of copy-pasting.** Every shell script and sample config shown below ships in [`dist/freebsd/`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/dist/freebsd) — copy them to your host directly. The walkthrough explains what each piece does and why.
+
 ## System dependencies
 
 Install the toolchain and runtime from `pkg`:

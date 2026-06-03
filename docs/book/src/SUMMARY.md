@@ -17,6 +17,7 @@
   - [FreeBSD](./setup/freebsd.md)
   - [Docker & containers](./setup/container.md)
   - [Service management](./setup/service.md)
+  - [Platform install files](./setup/dist-files.md)
 
 - [Architecture]()
   - [Overview](./architecture/overview.md)
