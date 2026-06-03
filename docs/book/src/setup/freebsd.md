@@ -210,6 +210,8 @@ esac
 
 [Jails](https://docs.freebsd.org/en/books/handbook/jails/) give ZeroClaw an isolated root with its own packages, service user, and optionally its own IP — useful if the host runs other services or you want to constrain the agent. **The service setup is identical to the host case; you just run it *inside* the jail.** This walks through a classic thick jail with base-system tooling (no jail manager required).
 
+> **One-step option.** [`dist/freebsd/zeroclaw-jail-setup.sh`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/dist/freebsd) automates steps 1–3 below — it creates the jail, extracts a matching base, adds the `/etc/jail.conf` entry, starts the jail, and installs the launcher + hardened `rc.d` script inside it (`doas sh zeroclaw-jail-setup.sh`, with `JAIL_NAME` / `JAIL_PATH` / `ZPOOL` / `ZEROCLAW_USER` overridable via env). The manual walkthrough below explains what it does.
+
 ### 1. Create the jail
 
 ```sh

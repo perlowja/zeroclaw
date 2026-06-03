@@ -12,6 +12,9 @@ rationale behind every `daemon(8)` flag — is in the handbook under
 | `zeroclaw-run.sh` | `/usr/local/libexec/zeroclaw-run.sh` | Launcher: sets `HOME`/`PATH`, execs `zeroclaw daemon`. |
 | `zeroclaw.rc` | `/usr/local/etc/rc.d/zeroclaw` | Basic single-instance service. |
 | `zeroclaw-hardened.rc` | `/usr/local/etc/rc.d/zeroclaw` | Hardened variant for unattended/remote operation. Use this **or** `zeroclaw.rc`, not both. |
+| `rc.conf.zeroclaw` | `/etc/rc.conf.d/zeroclaw` | Optional per-service `rc.conf` drop-in (`zeroclaw_enable`, `zeroclaw_runas`) — a file alternative to the `sysrc` lines below. |
+| `jail.conf.sample` | append to `/etc/jail.conf` | Sample thick-jail entry for running the service inside a jail. |
+| `zeroclaw-jail-setup.sh` | run on the host | Helper that provisions the jail end to end (dataset, base extract, jail.conf entry, service files) — see [Running in a jail](#running-in-a-jail). |
 
 The two `rc.d` scripts carry a `@@ZEROCLAW_USER@@` placeholder for the owning
 account — substitute it on install. The launcher needs no substitution: it runs
@@ -36,6 +39,30 @@ doas service zeroclaw status
 ```
 
 Swap `zeroclaw-hardened.rc` for `zeroclaw.rc` if you want the basic service.
+
+To set the rc.conf knobs from a file instead of `sysrc`, install the drop-in:
+
+```sh
+doas install -m 644 rc.conf.zeroclaw /etc/rc.conf.d/zeroclaw   # edit youruser first
+```
+
+## Running in a jail
+
+To run the service inside a thick jail, provision it end to end with the helper
+(run on the host as root); it creates the jail, extracts a matching base, adds
+the `/etc/jail.conf` entry, starts the jail, and installs the launcher + hardened
+`rc.d` script inside it:
+
+```sh
+doas sh zeroclaw-jail-setup.sh
+# override defaults via env, e.g.:
+#   JAIL_NAME=zc ZPOOL=tank ZEROCLAW_USER=agent doas sh zeroclaw-jail-setup.sh
+```
+
+It prints the remaining steps (install the `zeroclaw` binary, set up auth, start
+the service). To do it by hand instead, `jail.conf.sample` is the entry to append
+to `/etc/jail.conf`; the full manual walkthrough is in the handbook under
+**Setup → FreeBSD → Running in a jail**.
 
 ## Why the hardened variant
 
