@@ -47,7 +47,15 @@ impl RuntimeAdapter for NativeRuntime {
     ) -> anyhow::Result<tokio::process::Command> {
         #[cfg(not(target_os = "windows"))]
         {
-            let mut process = tokio::process::Command::new("sh");
+            // Android keeps its shell at /system/bin/sh and it is not always
+            // on PATH for spawned processes; use the absolute path when present
+            // so the shell can launch (and reach platform tools).
+            let shell = if std::path::Path::new("/system/bin/sh").exists() {
+                "/system/bin/sh"
+            } else {
+                "sh"
+            };
+            let mut process = tokio::process::Command::new(shell);
             process.arg("-c").arg(command).current_dir(workspace_dir);
             Ok(process)
         }

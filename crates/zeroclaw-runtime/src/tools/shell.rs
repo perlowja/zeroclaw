@@ -326,6 +326,20 @@ impl Tool for ShellTool {
             }
         }
 
+        // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
+        // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
+        // may omit them, leaving the shell unable to resolve any platform tool.
+        // Detect Android at runtime (works for bionic and musl builds).
+        if std::path::Path::new("/system/bin/sh").exists() {
+            let base = std::env::var("PATH").unwrap_or_default();
+            let android_path = if base.is_empty() {
+                String::from("/system/bin:/system/xbin")
+            } else {
+                format!("/system/bin:/system/xbin:{base}")
+            };
+            cmd.env("PATH", android_path);
+        }
+
         let timeout_secs = self.timeout_secs;
         // Run in own process group so `ChildGroupGuard` can reap the
         // whole subtree (backgrounded jobs, subshells) on any exit path.
