@@ -9973,7 +9973,18 @@ impl Config {
         if let Some(profile_name) = profile_name
             && !profile_name.eq_ignore_ascii_case(&profile_key)
         {
-            self.providers.fallback = Some(profile_name.to_string());
+            let canonical_key = profile_name.to_string();
+            // Mirror the profile under the provider factory key so runtime
+            // `fallback_provider()` lookups resolve — without this, rewriting a
+            // named profile (e.g. "bedrock_nova" with name = "bedrock") to its
+            // factory key orphans the entry and resolution silently falls
+            // through to the hardcoded default provider.
+            if !self.providers.models.contains_key(&canonical_key)
+                && let Some(entry) = self.providers.models.get(&profile_key).cloned()
+            {
+                self.providers.models.insert(canonical_key.clone(), entry);
+            }
+            self.providers.fallback = Some(canonical_key);
             return;
         }
 
