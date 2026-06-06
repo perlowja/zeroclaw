@@ -2402,6 +2402,30 @@ impl SecurityPolicy {
         // file_read/write/edit and the shell tool jail to the agent's
         // own dir, not the install-wide legacy path.
         let agent_workspace = config.agent_workspace_dir(agent_alias);
+        // The per-agent workspace is the shell tool's spawn cwd and the file-tool
+        // jail root. Create it here so every path that builds a per-agent policy
+        // (agent loop, gateway, channels) has the directory present. A missing cwd
+        // makes the shell tool's process spawn fail with ENOENT on a fresh agent.
+        if let Err(e) = std::fs::create_dir_all(&agent_workspace) {
+            // `agent_alias` is an alias-bound attribution field, so bind it through
+            // the span attribution system rather than as a free-form event attribute.
+            let _scope = ::zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                agent_alias = %agent_alias,
+            )
+            .entered();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "workspace": agent_workspace.display().to_string(),
+                        "error": e.to_string()
+                    })),
+                "SecurityPolicy::for_agent: failed to create agent workspace dir (continuing)"
+            );
+        }
         let mut policy = Self::from_profiles(risk_profile, runtime_profile, &agent_workspace);
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
