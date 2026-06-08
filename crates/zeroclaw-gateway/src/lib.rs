@@ -64,6 +64,38 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Backoff after a transient `accept()` error so the serve loop does not
+/// hot-spin while the condition (e.g. fd exhaustion) clears.
+const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
+
+/// File-descriptor exhaustion errno values, stable across the Unix targets
+/// we support (Linux, macOS, BSD).
+#[cfg(unix)]
+const EMFILE: i32 = 24; // too many open files (this process)
+#[cfg(unix)]
+const ENFILE: i32 = 23; // too many open files (system-wide)
+
+/// Returns `true` when an error from a stream listener's `accept()` is
+/// transient and the listener itself remains usable, so the serve loop
+/// should log and keep running rather than terminating the daemon. Covers
+/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
+/// per-connection hiccups. Mirrors the non-fatal accept handling that
+/// `axum::serve` already performs on the plain-TCP path.
+fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        return true;
+    }
+    false
+}
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -1768,7 +1800,21 @@ pub async fn run_gateway(
         loop {
             tokio::select! {
                 conn = listener.accept() => {
-                    let (tcp_stream, remote_addr) = conn?;
+                    let (tcp_stream, remote_addr) = match conn {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            if is_recoverable_accept_error(&e) {
+                                // Transient (e.g. EMFILE under fd pressure):
+                                // the listener is still valid. Back off
+                                // briefly to avoid hot-spinning, then keep
+                                // serving rather than killing the daemon (#7042).
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
+                                tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                                continue;
+                            }
+                            return Err(e.into());
+                        }
+                    };
                     let tls_acceptor = tls_acceptor.clone();
                     let svc = tower::MakeService::<
                         SocketAddr,
@@ -6557,5 +6603,33 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::is_recoverable_accept_error;
+    use std::io::{Error, ErrorKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_accept_errors_are_recoverable() {
+        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn transient_kinds_recover_but_fatal_propagates() {
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        // A non-transient error is not swallowed (loop will propagate it).
+        assert!(!is_recoverable_accept_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
     }
 }
