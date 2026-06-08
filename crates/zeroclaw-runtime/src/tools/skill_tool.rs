@@ -19,6 +19,58 @@ const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
+/// Maximum provider function-name length (`^[a-zA-Z0-9_-]{1,128}$`).
+const MAX_TOOL_NAME_LEN: usize = 128;
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Dependency-free, build-stable 64-bit FNV-1a hash, rendered as 16 hex chars.
+/// Used only to disambiguate names that had to be altered; not a uniqueness
+/// proof (a bounded namespace cannot be truly injective), just a strong reducer
+/// of accidental collisions among sanitized names.
+fn short_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Sanitize a composed skill tool name so it satisfies provider function-name
+/// rules (`^[a-zA-Z0-9_-]{1,128}$`). The `__` separator is already safe, but a
+/// skill or tool name can itself contain illegal characters — dots, spaces, or
+/// colons (plugin-namespaced skills such as `pr-review-toolkit:code-reviewer`),
+/// or non-ASCII. Anthropic rejects non-conforming names outright (issue #6678).
+///
+/// Names that are already valid and within length are returned unchanged. Any
+/// name that must be altered (illegal characters or over-length) gets every
+/// disallowed character mapped to `_` and a short stable hash of the original
+/// composed name appended within the 128-char budget. The hash keeps the result
+/// injective: distinct inputs that would otherwise collapse to the same string
+/// — `a.b__run` vs `a:b__run`, or different tools under a >128-char skill name
+/// whose suffix would be truncated away — stay distinct.
+fn sanitize_tool_name(raw: &str) -> String {
+    let already_valid =
+        !raw.is_empty() && raw.len() <= MAX_TOOL_NAME_LEN && raw.chars().all(is_name_char);
+    if already_valid {
+        return raw.to_string();
+    }
+
+    let mapped: String = raw
+        .chars()
+        .map(|c| if is_name_char(c) { c } else { '_' })
+        .collect();
+
+    // Reserve room for `_<8 hex>` so the disambiguating hash always survives.
+    let suffix = format!("_{}", short_hash(raw));
+    let budget = MAX_TOOL_NAME_LEN - suffix.len();
+    let head: String = mapped.chars().take(budget).collect();
+    format!("{head}{suffix}")
+}
+
 /// A tool derived from a skill's `[[tools]]` section that executes shell commands.
 pub struct SkillShellTool {
     tool_name: String,
@@ -39,7 +91,7 @@ impl SkillShellTool {
         security: Arc<SecurityPolicy>,
     ) -> Self {
         Self {
-            tool_name: format!("{}__{}", skill_name, tool.name),
+            tool_name: sanitize_tool_name(&format!("{}__{}", skill_name, tool.name)),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
@@ -239,7 +291,7 @@ impl SkillBuiltinTool {
             .collect();
         let advertised_schema = narrow_schema(target_tool.parameters_schema(), &locked);
         Self {
-            tool_name: format!("{}__{}", skill_name, tool.name),
+            tool_name: sanitize_tool_name(&format!("{}__{}", skill_name, tool.name)),
             tool_description: tool.description.clone(),
             target_tool,
             locked_args: locked,
@@ -362,6 +414,72 @@ mod tests {
     fn skill_shell_tool_name_is_prefixed() {
         let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
         assert_eq!(tool.name(), "my_skill__run_lint");
+    }
+
+    fn name_is_provider_valid(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 128
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn skill_tool_name_sanitized_for_provider_regex() {
+        // Plugin-namespaced skill names (colons), dotted names, spaces, and
+        // non-ASCII must all yield a provider-valid function name (#6678).
+        for (skill, tool_name) in [
+            ("pr-review-toolkit:code-reviewer", "run.lint"),
+            ("my skill", "do thing"),
+            ("skill.with.dots", "tool"),
+            ("ünïcode", "naïve"),
+        ] {
+            let mut st = sample_skill_tool();
+            st.name = tool_name.to_string();
+            let tool = SkillShellTool::new(skill, &st, test_security());
+            assert!(
+                name_is_provider_valid(tool.name()),
+                "illegal tool name `{}` from skill `{}`",
+                tool.name(),
+                skill
+            );
+        }
+    }
+
+    fn shell_tool_name(skill: &str, tool_name: &str) -> String {
+        let mut st = sample_skill_tool();
+        st.name = tool_name.to_string();
+        SkillShellTool::new(skill, &st, test_security())
+            .name()
+            .to_string()
+    }
+
+    #[test]
+    fn skill_tool_already_valid_name_is_unchanged() {
+        // The common case must not be perturbed (no spurious hash suffix).
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        assert_eq!(tool.name(), "my_skill__run_lint");
+    }
+
+    #[test]
+    fn skill_tool_name_truncated_to_128_and_stays_distinct() {
+        // A skill name longer than the limit must not let two distinct tools
+        // collapse to the same advertised name after truncation (#6678).
+        let long = "a".repeat(200);
+        let a = shell_tool_name(&long, "alpha");
+        let b = shell_tool_name(&long, "beta");
+        assert!(a.len() <= 128 && b.len() <= 128);
+        assert!(name_is_provider_valid(&a) && name_is_provider_valid(&b));
+        assert_ne!(a, b, "distinct tools under a long skill name collided");
+    }
+
+    #[test]
+    fn skill_tool_name_sanitization_is_injective() {
+        // Inputs differing only by illegal characters must not collide.
+        let a = shell_tool_name("a.b", "run");
+        let b = shell_tool_name("a:b", "run");
+        assert!(name_is_provider_valid(&a) && name_is_provider_valid(&b));
+        assert_ne!(a, b, "illegal-char variants collapsed to the same name");
     }
 
     #[test]
