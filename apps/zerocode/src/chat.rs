@@ -874,7 +874,7 @@ impl Chat {
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
         if state.pending_approval().is_none() && !state.in_browse_mode() {
-            let action = state.input_bar.handle_key(key, state.turn_in_flight);
+            let action = state.input_bar.handle_key(key);
             match action {
                 InputBarAction::Submit { text, attachments } => {
                     state.clear_info_notice();
@@ -4523,8 +4523,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0}
                 ]
             })),
             None,
@@ -4566,8 +4566,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 1}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 1}
                 ]
             })),
             None,
@@ -4695,8 +4695,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0}
                 ]
             })),
             None,
