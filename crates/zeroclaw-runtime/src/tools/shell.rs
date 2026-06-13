@@ -6,6 +6,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::platform::is_android;
 use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 
 /// Maximum output size in bytes (1MB).
@@ -351,8 +352,13 @@ impl Tool for ShellTool {
         // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
         // may omit them, leaving the shell unable to resolve any platform tool.
         // Detect Android at runtime (works for bionic and musl builds).
-        if std::path::Path::new("/system/bin/sh").exists() {
-            let base = std::env::var("PATH").unwrap_or_default();
+        if is_android() {
+            let base = self
+                .tui_env
+                .as_ref()
+                .and_then(|env| env.get("PATH"))
+                .cloned()
+                .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
             let android_path = if base.is_empty() {
                 String::from("/system/bin:/system/xbin")
             } else {
