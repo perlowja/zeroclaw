@@ -11849,13 +11849,24 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Slack bot OAuth token (xoxb-...).
+    /// Slack bot OAuth token (xoxb-...). Optional in config: when unset or
+    /// empty it is resolved at channel construction from
+    /// `ZEROCLAW_SLACK_BOT_TOKEN`, then `SLACK_BOT_TOKEN`. `#[serde(default)]`
+    /// so a config that omits it still deserializes — the env fallback then
+    /// supplies it — instead of failing with `missing field 'bot_token'`.
+    /// See #6844 / #6237.
     #[secret]
+    #[serde(default)]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub bot_token: String,
-    /// Slack app-level token for Socket Mode (xapp-...).
+    pub bot_token: Option<String>,
+    /// Slack app-level token for Socket Mode (xapp-...). When unset or empty,
+    /// resolved at channel construction from `ZEROCLAW_SLACK_APP_TOKEN`, then
+    /// `SLACK_APP_TOKEN`. `#[serde(default)]` makes omission explicit (an
+    /// `Option` field is already omittable, but this keeps it consistent with
+    /// `bot_token`).
     #[secret]
+    #[serde(default)]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_token: Option<String>,
@@ -11948,6 +11959,50 @@ impl ChannelConfig for SlackConfig {
     fn desc() -> &'static str {
         "connect your bot"
     }
+}
+
+impl SlackConfig {
+    /// Resolve the effective Slack bot token: the configured `bot_token` when
+    /// set and non-empty, else the `ZEROCLAW_SLACK_BOT_TOKEN` env var, else
+    /// `SLACK_BOT_TOKEN`. Returns `None` when none is available. Resolving here
+    /// (rather than writing the env value back into the config struct) keeps an
+    /// env-supplied secret out of any config that might later be persisted to
+    /// disk. See #6844 / #6237.
+    pub fn resolved_bot_token(&self) -> Option<String> {
+        resolve_slack_token(self.bot_token.as_deref(), "BOT")
+    }
+
+    /// Resolve the effective Slack app-level (Socket Mode) token: configured
+    /// `app_token` when set and non-empty, else `ZEROCLAW_SLACK_APP_TOKEN`,
+    /// else `SLACK_APP_TOKEN`. Returns `None` when none is available.
+    pub fn resolved_app_token(&self) -> Option<String> {
+        resolve_slack_token(self.app_token.as_deref(), "APP")
+    }
+}
+
+/// Shared token resolution for [`SlackConfig`]: a non-empty configured value
+/// wins; otherwise the `ZEROCLAW_SLACK_<KIND>_TOKEN` env var takes precedence
+/// over the conventional `SLACK_<KIND>_TOKEN`. Blank values (config or env) are
+/// treated as absent. `kind` is `"BOT"` or `"APP"`.
+fn resolve_slack_token(configured: Option<&str>, kind: &str) -> Option<String> {
+    if let Some(value) = configured {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    for var in [
+        format!("ZEROCLAW_SLACK_{kind}_TOKEN"),
+        format!("SLACK_{kind}_TOKEN"),
+    ] {
+        if let Ok(value) = std::env::var(&var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Mattermost bot channel configuration.
@@ -22148,6 +22203,91 @@ default_temperature = 0.7
         // module serialize against `env_overrides::tests` too. Without
         // this, tests across the two modules race on `ZEROCLAW_*` vars.
         crate::env_overrides::env_test_lock().await
+    }
+
+    #[test]
+    async fn slack_config_deserializes_without_bot_token() {
+        // Regression for #6844 / #6237: before `bot_token` became
+        // `Option<String>` + `#[serde(default)]`, a config that omitted it
+        // failed to deserialize with `missing field 'bot_token'`, aborting
+        // startup before the env-var fallback could ever run.
+        let parsed: SlackConfig = toml::from_str("enabled = true\n")
+            .expect("SlackConfig must deserialize without bot_token");
+        assert!(parsed.bot_token.is_none());
+    }
+
+    #[test]
+    async fn slack_config_deserializes_explicit_bot_token() {
+        let parsed: SlackConfig =
+            toml::from_str("enabled = true\nbot_token = \"xoxb-from-toml\"\n").unwrap();
+        assert_eq!(parsed.bot_token.as_deref(), Some("xoxb-from-toml"));
+    }
+
+    /// Set (`Some`) or clear (`None`) an env var. Callers must hold
+    /// `env_override_lock()`. Used to snapshot-and-restore the Slack token
+    /// vars so these tests leave the process environment exactly as found.
+    fn set_or_clear_env(key: &str, value: Option<&str>) {
+        // SAFETY: callers serialize on env_override_lock().
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_falls_back_to_env() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        let prev_zc = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", None);
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-from-env"));
+
+        let cfg = SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_bot_token().as_deref(), Some("xoxb-from-env"));
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", prev_zc.as_deref());
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_prefers_zeroclaw_prefix() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        let prev_zc = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-generic"));
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", Some("xoxb-zeroclaw"));
+
+        let cfg = SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_bot_token().as_deref(), Some("xoxb-zeroclaw"));
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", prev_zc.as_deref());
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_prefers_config_over_env() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-from-env"));
+
+        let cfg = SlackConfig {
+            bot_token: Some("xoxb-from-config".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_bot_token().as_deref(),
+            Some("xoxb-from-config")
+        );
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
     }
 
     #[test]
