@@ -353,18 +353,13 @@ impl Tool for ShellTool {
         // may omit them, leaving the shell unable to resolve any platform tool.
         // Detect Android at runtime (works for bionic and musl builds).
         if is_android() {
-            let base = self
+            let ambient = std::env::var("PATH").unwrap_or_default();
+            let tui_path = self
                 .tui_env
                 .as_ref()
                 .and_then(|env| env.get("PATH"))
-                .cloned()
-                .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-            let android_path = if base.is_empty() {
-                String::from("/system/bin:/system/xbin")
-            } else {
-                format!("/system/bin:/system/xbin:{base}")
-            };
-            cmd.env("PATH", android_path);
+                .map(String::as_str);
+            cmd.env("PATH", android_child_path(tui_path, &ambient));
         }
 
         let timeout_secs = self.timeout_secs;
@@ -496,8 +491,42 @@ where
     buf
 }
 
+/// Compose the child `PATH` for an Android shell: the platform tool dirs
+/// (`/system/bin:/system/xbin`) are prefixed onto the curated PATH, with a
+/// TUI-provided PATH winning over the daemon's ambient PATH. Yields the bare
+/// platform dirs when the resolved base is empty.
+fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
+    let base = tui_path.unwrap_or(ambient_path);
+    if base.is_empty() {
+        "/system/bin:/system/xbin".to_string()
+    } else {
+        format!("/system/bin:/system/xbin:{base}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn android_child_path_prefixes_platform_dirs_with_tui_path_winning() {
+        assert_eq!(
+            super::android_child_path(Some("/usr/local/bin"), "/daemon"),
+            "/system/bin:/system/xbin:/usr/local/bin"
+        );
+        assert_eq!(
+            super::android_child_path(None, "/daemon"),
+            "/system/bin:/system/xbin:/daemon"
+        );
+        assert_eq!(
+            super::android_child_path(None, ""),
+            "/system/bin:/system/xbin"
+        );
+    }
+
+    #[test]
+    fn is_android_returns_bool_without_panicking() {
+        let _ = zeroclaw_api::platform::is_android();
+    }
     use super::*;
     use crate::platform::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};

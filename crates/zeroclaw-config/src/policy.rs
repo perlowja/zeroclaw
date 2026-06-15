@@ -4487,6 +4487,47 @@ mod tests {
     }
 
     #[test]
+    fn for_agent_creates_the_per_agent_workspace_dir() {
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-for-agent-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cfg = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        cfg.agents.insert(
+            "agent_a".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let ws = cfg.agent_workspace_dir("agent_a");
+        assert!(
+            !ws.exists(),
+            "precondition: workspace dir must not exist yet"
+        );
+
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+
+        assert!(
+            ws.exists(),
+            "for_agent must create the per-agent workspace dir at the chokepoint"
+        );
+        assert_eq!(
+            policy.workspace_dir, ws,
+            "policy cwd/jail root must be the created workspace dir"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn for_agent_unrestricted_filesystem_disables_workspace_only() {
         use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
