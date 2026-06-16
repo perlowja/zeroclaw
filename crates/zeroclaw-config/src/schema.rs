@@ -11852,8 +11852,8 @@ pub struct SlackConfig {
     /// Slack bot OAuth token (xoxb-...). Optional in config: when unset or
     /// empty it is resolved at channel construction from
     /// `ZEROCLAW_SLACK_BOT_TOKEN`, then `SLACK_BOT_TOKEN`. `#[serde(default)]`
-    /// so a config that omits it still deserializes — the env fallback then
-    /// supplies it — instead of failing with `missing field 'bot_token'`.
+    /// so a config that omits it still deserializes - the env fallback then
+    /// supplies it - instead of failing with `missing field 'bot_token'`.
     /// See #6844 / #6237.
     #[secret]
     #[serde(default)]

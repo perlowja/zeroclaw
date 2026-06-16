@@ -6785,7 +6785,7 @@ fn collect_configured_channels(
         };
         let Some(bot_token) = sl.resolved_bot_token() else {
             // `collect_configured_channels` returns `Vec<ConfiguredChannel>`
-            // (not `Result`) and is fail-soft by contract — one misconfigured
+            // (not `Result`) and is fail-soft by contract - one misconfigured
             // channel must not abort startup for every other channel. So an
             // enabled-but-tokenless Slack channel is skipped, but logged at
             // ERROR (an operator's enabled channel failed to come up) with the
