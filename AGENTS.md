@@ -193,6 +193,9 @@ Idempotent (auto-applies `rustfmt`; everything else is read-only). It runs the
    unformatted branch skips all other checks and fails `CI Required Gate`.
 2. `scripts/ci/rust_quality_gate.sh --strict` — clippy `-D warnings` plus the
    provider-dispatch SSOT gate.
+2b. `cargo clippy/check --all-targets --all-features` — CI's `Lint` and
+   `Check (all features)` jobs run with `--all-features`, which the repo gate
+   above does not; feature-gated breakage slips past default-feature checks.
 3. `cargo check --all-targets --locked` — every target must compile. Never push
    code you did not build.
 4. `cargo test --locked`.

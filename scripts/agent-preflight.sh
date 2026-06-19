@@ -19,14 +19,19 @@ run() { printf '\n\033[1m==> %s\033[0m\n' "$*"; "$@" || { echo "::error::FAILED:
 printf '\n\033[1m==> cargo fmt --all (auto-apply)\033[0m\n'; cargo fmt --all || fail=1
 run cargo fmt --all -- --check
 
-# 2. Full Rust quality gate CI runs (clippy -D warnings + provider-dispatch gate).
+# 2. Repo quality gate (clippy -D warnings + provider-dispatch SSOT gate).
 run ./scripts/ci/rust_quality_gate.sh --strict
 
-# 3. Compile every target (catches the "looked fine, didn't build" class).
+# 2b. CI's Lint/Check jobs run with --all-features; the repo gate above only uses
+#     --all-targets, so feature-gated breakage slips past it. Match CI explicitly.
+run cargo clippy --all-targets --all-features --locked -- -D warnings
+run cargo check --all-targets --all-features --locked
+
+# 3. Compile every target with default features too.
 run cargo check --all-targets --locked
 
-# 4. Tests.
-run cargo test --locked
+# 4. Tests (all features, matching CI).
+run cargo test --all-features --locked
 
 # 5. PR title — Conventional Commits with scope (the `main` CI check).
 if [ "${1-}" != "" ]; then
