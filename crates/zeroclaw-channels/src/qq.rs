@@ -877,20 +877,32 @@ impl QQChannel {
     }
 
     /// Send a media message (msg_type=7) with an already-uploaded file_info.
-    async fn send_media_message(&self, recipient: &str, file_info: &str) -> anyhow::Result<()> {
+    async fn send_media_message(
+        &self,
+        recipient: &str,
+        file_info: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
+        let mut body = json!({
             "msg_type": 7,
             "media": {
                 "file_info": file_info,
             },
             "msg_seq": next_msg_seq(),
         });
+
+        // Add refer_msg for passive replies (QQ threading/reply support)
+        if let Some(ref_msg_id) = in_reply_to {
+            body["refer_msg"] = json!({
+                "message_id": ref_msg_id,
+            });
+        }
 
         let resp = self
             .http_client()
@@ -914,6 +926,7 @@ impl QQChannel {
         &self,
         recipient: &str,
         attachment: &QQMediaAttachment,
+        in_reply_to: Option<&str>,
     ) -> anyhow::Result<()> {
         let target = attachment.target.trim();
 
@@ -934,7 +947,7 @@ impl QQChannel {
                     file_name.as_deref(),
                 )
                 .await?;
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to).await?;
         } else {
             // Local file upload
             let path = Path::new(target);
@@ -968,7 +981,7 @@ impl QQChannel {
                         .with_attrs(::serde_json::json!({"target": target})),
                     "using cached upload for"
                 );
-                self.send_media_message(recipient, &cached_file_info)
+                self.send_media_message(recipient, &cached_file_info, in_reply_to)
                     .await?;
                 return Ok(());
             }
@@ -990,7 +1003,7 @@ impl QQChannel {
                     .await;
             }
 
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to).await?;
         }
 
         Ok(())
@@ -1228,20 +1241,32 @@ impl QQChannel {
     }
 
     /// Send a markdown text message (msg_type=2).
-    async fn send_text_markdown(&self, recipient: &str, content: &str) -> anyhow::Result<()> {
+    async fn send_text_markdown(
+        &self,
+        recipient: &str,
+        content: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
+        let mut body = json!({
             "markdown": {
                 "content": content,
             },
             "msg_type": 2,
             "msg_seq": next_msg_seq(),
         });
+
+        // Add refer_msg for passive replies (QQ threading/reply support)
+        if let Some(ref_msg_id) = in_reply_to {
+            body["refer_msg"] = json!({
+                "message_id": ref_msg_id,
+            });
+        }
 
         let resp = self
             .http_client()
@@ -1278,23 +1303,24 @@ impl Channel for QQChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
+        let in_reply_to = message.in_reply_to.as_deref();
 
         if attachments.is_empty() {
             // No media markers — send as markdown (original path)
             return self
-                .send_text_markdown(&message.recipient, &message.content)
+                .send_text_markdown(&message.recipient, &message.content, in_reply_to)
                 .await;
         }
 
         // Send cleaned text first (if non-empty)
         if !cleaned_text.is_empty() {
-            self.send_text_markdown(&message.recipient, &cleaned_text)
+            self.send_text_markdown(&message.recipient, &cleaned_text, in_reply_to)
                 .await?;
         }
 
         // Send each media attachment
         for attachment in &attachments {
-            if let Err(e) = self.send_attachment(&message.recipient, attachment).await {
+            if let Err(e) = self.send_attachment(&message.recipient, attachment, None).await {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
                 // Degrade to text fallback
                 let fallback = format!(
@@ -1307,7 +1333,7 @@ impl Channel for QQChannel {
                     },
                     attachment.target
                 );
-                self.send_text_markdown(&message.recipient, &fallback)
+                self.send_text_markdown(&message.recipient, &fallback, None)
                     .await?;
             }
         }
@@ -1574,14 +1600,17 @@ impl Channel for QQChannel {
 
                     match event_type {
                         "C2C_MESSAGE_CREATE" => {
+                            // Capture msg_id early so it can be used in the ChannelMessage id field
                             let msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                             if self.is_duplicate(msg_id).await {
                                 continue;
                             }
 
-                            let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("unknown");
+                            let author_id =
+                                d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("unknown");
                             // For QQ, user_openid is the identifier
-                            let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
+                            let user_openid =
+                                d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
 
                             if !self.is_user_allowed(user_openid) {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_openid": user_openid})), "ignoring C2C message from unauthorized user");
@@ -1624,7 +1653,7 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                id: msg_id.to_string(),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -1696,7 +1725,7 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                id: msg_id.to_string(),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
