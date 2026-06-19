@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_config::schema::{StreamMode, WeComWsConfig};
 use zeroclaw_runtime::i18n;
 
@@ -1431,9 +1432,122 @@ impl WeComWsChannel {
 
         Ok(())
     }
-}
 
-// ── Channel trait impl ───────────────────────────────────────────────
+    /// Upload a media file and send it via `aibot_send_msg` with the appropriate
+    /// WeCom `msgtype` (`image` or `file`).
+    async fn send_attachment(&self, scope: &str, attachment: &MediaAttachment) -> Result<()> {
+        use base64::Engine as _;
+
+        let (chat_type, chatid) = parse_scope(scope)?;
+
+        // Upload via WeCom media/upload CGI
+        let upload_url = format!(
+            "https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token={token}&type={media_type}",
+            token = self.resolve_access_token().await?,
+            media_type = match attachment.kind() {
+                zeroclaw_api::media::MediaKind::Image => "image",
+                zeroclaw_api::media::MediaKind::Audio => "voice",
+                zeroclaw_api::media::MediaKind::Video => "video",
+                zeroclaw_api::media::MediaKind::Unknown => "file",
+            }
+        );
+
+        let form = reqwest::multipart::Form::new()
+            .part(
+                "media",
+                reqwest::multipart::Part::bytes(attachment.data.clone())
+                    .file_name(attachment.file_name.clone())
+                    .mime_str(attachment.mime_type.as_deref().unwrap_or("application/octet-stream")),
+            );
+
+        let resp = self
+            .client
+            .post(&upload_url)
+            .multipart(form)
+            .send()
+            .await
+            .with_context(|| format!("media upload failed: {}", attachment.file_name))?;
+
+        #[derive(serde::Deserialize)]
+        struct UploadResp {
+            #[serde(rename = "media_id")]
+            media_id: Option<String>,
+            errcode: Option<i64>,
+            errmsg: Option<String>,
+        }
+
+        let upload: UploadResp = resp.json().await?;
+        let media_id = upload
+            .media_id
+            .ok_or_else(|| anyhow::anyhow!("WeCom upload response missing media_id: {:?}", upload.errmsg))?;
+
+        // Dispatch the actual message via aibot_send_msg
+        let msgtype = match attachment.kind() {
+            zeroclaw_api::media::MediaKind::Image => "image",
+            zeroclaw_api::media::MediaKind::Audio => "voice",
+            zeroclaw_api::media::MediaKind::Video => "video",
+            zeroclaw_api::media::MediaKind::Unknown => "file",
+        };
+
+        let frame = serde_json::json!({
+            "cmd": "aibot_send_msg",
+            "headers": { "req_id": random_ascii_token(16) },
+            "body": {
+                "chatid": chatid,
+                "chat_type": chat_type,
+                "msgtype": msgtype,
+                msgtype => { "media_id": media_id }
+            }
+        });
+
+        self.ws_send_frame_and_wait_for_response(frame, "unused", "aibot_send_msg")
+            .await?;
+
+        wecom_log_info!(
+            "WeCom attachment sent msgtype={} file={} scope={}",
+            msgtype,
+            attachment.file_name,
+            scope
+        );
+
+        Ok(())
+    }
+
+    /// Resolve the current access token for the bot's credentials.
+    async fn resolve_access_token(&self) -> Result<String> {
+        // Fetch a fresh access token from WeCom's gettoken endpoint using the
+        // bot's bot_id (agentid) and secret from the channel config.
+        #[derive(serde::Deserialize)]
+        struct TokenResp {
+            #[serde(rename = "access_token")]
+            access_token: Option<String>,
+            errcode: Option<i64>,
+            errmsg: Option<String>,
+        }
+
+        let url = format!(
+            "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={}&corpsecret={}",
+            self.bot_id,
+            self.secret,
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| "failed to fetch WeCom access token")?;
+
+        let token: TokenResp = resp
+            .json()
+            .await
+            .with_context(|| "failed to parse WeCom token response")?;
+
+        token
+            .access_token
+            .ok_or_else(|| anyhow::anyhow!("WeCom gettoken failed: {:?}", token.errmsg))
+    }
+}
 
 impl ::zeroclaw_api::attribution::Attributable for WeComWsChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -1454,6 +1568,12 @@ impl Channel for WeComWsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
+        if message.recipient.starts_with("external--") {
+            return self
+                .send_external_user_message(&message.recipient, &message.content)
+                .await;
+        }
+
         if let Some(req_id) = message
             .thread_ts
             .as_deref()
@@ -1474,11 +1594,96 @@ impl Channel for WeComWsChannel {
                     .await?;
             }
 
+            // Send attachments after streaming response
+            for attachment in &message.attachments {
+                self.send_attachment(&message.recipient, attachment).await?;
+            }
+
             return Ok(());
         }
 
         self.send_markdown_chunks_to_scope(&message.recipient, &message.content)
+            .await?;
+
+        // Send attachments after text content
+        for attachment in &message.attachments {
+            self.send_attachment(&message.recipient, attachment).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Send a proactive message to an external user via the WeCom
+    /// `agent/send_message` HTTP API (chat_type=3).
+    ///
+    /// The `scope` must have the `external--` prefix, e.g. `external--zhangsan@example.com`.
+    /// This path is used for outbound-initiated (proactive) messages to external contacts,
+    /// which require the application to have external contact permissions and cannot be
+    /// sent over the WebSocket `aibot_send_msg` channel.
+    async fn send_external_user_message(&self, scope: &str, content: &str) -> Result<()> {
+        let external_user_id = scope
+            .strip_prefix("external--")
+            .ok_or_else(|| anyhow::anyhow!("invalid external scope: {scope}"))?;
+
+        let token = self.resolve_access_token().await?;
+
+        // WeCom application message API — sends a text message to an external user.
+        // The agentid (bot_id) and external_userid identify the sender application and
+        // the target external contact respectively.
+        #[derive(serde::Serialize)]
+        struct AgentMsgBody<'a> {
+            #[serde(rename = "touser")]
+            touser: &'a str,
+            #[serde(rename = "agentid")]
+            agentid: &'a str,
+            #[serde(rename = "msgtype")]
+            msgtype: &'a str,
+            #[serde(rename = "text")]
+            text: &'a serde_json::Value,
+        }
+
+        let body = AgentMsgBody {
+            touser: external_user_id,
+            agentid: &self.bot_id,
+            msgtype: "text",
+            text: &serde_json::json!({ "content": content }),
+        };
+
+        let url = format!(
+            "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}",
+            token = token
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
             .await
+            .with_context(|| format!("WeCom external message send failed"))?;
+
+        #[derive(serde::Deserialize)]
+        struct ApiResp {
+            errcode: Option<i64>,
+            errmsg: Option<String>,
+        }
+
+        let result: ApiResp = resp.json().await?;
+        let errcode = result.errcode.unwrap_or(-1);
+        if errcode != 0 {
+            anyhow::bail!(
+                "WeCom external message API error (errcode={}): {:?}",
+                errcode,
+                result.errmsg
+            );
+        }
+
+        wecom_log_info!(
+            "WeCom external proactive message sent to={} len={}",
+            external_user_id,
+            content.len()
+        );
+        Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -2079,6 +2284,11 @@ fn parse_scope(scope: &str) -> Result<(u32, &str)> {
         Ok((1, userid))
     } else if let Some(chatid) = scope.strip_prefix("group--") {
         Ok((2, chatid))
+    } else if let Some(external_user_id) = scope.strip_prefix("external--") {
+        // Proactive messaging to external users via WeCom application message API.
+        // chat_type 3 is "external" — sends a WeCom application message to an
+        // external user (requires the application to have external contact permissions).
+        Ok((3, external_user_id))
     } else {
         anyhow::bail!("WeCom: invalid scope format: {scope}")
     }
@@ -2884,6 +3094,12 @@ mod tests {
         assert!(summary.contains("feedback_id=fb_1"));
         assert!(summary.contains("feedback_type=2"));
         assert!(summary.contains("content=not accurate"));
+    }
+
+    #[test]
+    fn parse_scope_external() {
+        assert_eq!(parse_scope("external--zhangsan@example.com"), Ok((3, "zhangsan@example.com")));
+        assert_eq!(parse_scope("external--lisi@external.com"), Ok((3, "lisi@external.com")));
     }
 
     #[test]
