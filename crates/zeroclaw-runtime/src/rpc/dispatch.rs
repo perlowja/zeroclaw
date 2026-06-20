@@ -1994,7 +1994,7 @@ impl RpcDispatcher {
             format!("gw_{}", req.session_id),
         ];
         let backend = Arc::clone(backend);
-        let raw: Vec<zeroclaw_api::model_provider::ChatMessage> =
+        let mut raw: Vec<zeroclaw_api::model_provider::ChatMessage> =
             tokio::task::spawn_blocking(move || {
                 for key in &candidates {
                     let loaded = backend.load(key);
