@@ -1973,6 +1973,31 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         true
     }
 
+    /// Merge parsed media-group items and derive the synthetic album id.
+    ///
+    /// Callers must pass at least one parsed item; the first item is the
+    /// anchor for the album id.
+    fn merge_album_messages(items: &[ChannelMessage]) -> (String, String) {
+        debug_assert!(
+            !items.is_empty(),
+            "album merge requires at least one parsed message"
+        );
+        let anchor = &items[0];
+
+        let mut merged_content = String::new();
+        for (i, msg) in items.iter().enumerate() {
+            if i > 0 {
+                merged_content.push_str("\n\n");
+            }
+            merged_content.push_str(&msg.content);
+        }
+
+        let id_suffix = anchor.id.strip_prefix("telegram_").unwrap_or(&anchor.id);
+        let album_id = format!("telegram_album_{id_suffix}");
+
+        (merged_content, album_id)
+    }
+
     /// Flush any buffered media-group entries whose `last_seen` is
     /// older than `MEDIA_GROUP_FLUSH_WINDOW`. Each flushed entry is
     /// dispatched as a single merged `ChannelMessage` via `tx`.
@@ -2039,20 +2064,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // so the agent sees every file in the album in arrival
             // order.
             let anchor = parsed[0].clone();
-            let mut merged_content = String::new();
-            for (i, msg) in parsed.iter().enumerate() {
-                if i > 0 {
-                    merged_content.push_str("\n\n");
-                }
-                merged_content.push_str(&msg.content);
-            }
-
-            // Use a stable, collision-resistant id derived from the
-            // first item's chat_id + message_id. Prefix with
-            // `telegram_album_` so the album's id never collides with
-            // any per-item `telegram_<chat>_<msg>` id.
-            let id_suffix = anchor.id.strip_prefix("telegram_").unwrap_or(&anchor.id);
-            let album_id = format!("telegram_album_{id_suffix}");
+            let (merged_content, album_id) = Self::merge_album_messages(&parsed);
 
             // Same ack-reaction + typing-indicator treatment as the
             // per-message path, but applied to the album anchor's
@@ -7904,6 +7916,55 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    fn album_message(id: &str, content: &str) -> ChannelMessage {
+        ChannelMessage {
+            id: id.into(),
+            content: content.into(),
+            ..ChannelMessage::default()
+        }
+    }
+
+    #[test]
+    fn merge_album_messages_merges_multiple_items_in_order_with_blank_lines() {
+        let items = vec![
+            album_message("telegram_100_1", "first"),
+            album_message("telegram_100_2", "second"),
+            album_message("telegram_100_3", "third"),
+        ];
+
+        let (merged_content, _) = TelegramChannel::merge_album_messages(&items);
+
+        assert_eq!(merged_content, "first\n\nsecond\n\nthird");
+    }
+
+    #[test]
+    fn merge_album_messages_strips_telegram_prefix_for_album_id() {
+        let items = vec![album_message("telegram_100_1", "first")];
+
+        let (_, album_id) = TelegramChannel::merge_album_messages(&items);
+
+        assert_eq!(album_id, "telegram_album_100_1");
+    }
+
+    #[test]
+    fn merge_album_messages_prefixes_album_id_when_anchor_has_no_telegram_prefix() {
+        let items = vec![album_message("custom_anchor", "first")];
+
+        let (_, album_id) = TelegramChannel::merge_album_messages(&items);
+
+        assert_eq!(album_id, "telegram_album_custom_anchor");
+    }
+
+    #[test]
+    fn merge_album_messages_handles_single_item_album() {
+        let items = vec![album_message("telegram_200_9", "only item")];
+
+        let (merged_content, album_id) = TelegramChannel::merge_album_messages(&items);
+
+        assert_eq!(merged_content, "only item");
+        assert_eq!(album_id, "telegram_album_200_9");
     }
 
     #[test]
