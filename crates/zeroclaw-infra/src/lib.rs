@@ -101,18 +101,45 @@ pub fn make_session_backend(
             Ok(Arc::new(store))
         }
 
+        // A known backend whose feature was NOT compiled in must fail fast
+        // rather than silently fall back to local SQLite: a configured shared
+        // backend degrading to per-host SQLite is exactly the split-session
+        // history bug this feature exists to prevent. A genuinely unknown value
+        // (a typo) still falls through to the SQLite default below.
+        #[cfg(not(feature = "backend-postgres"))]
+        "postgres" => Err(unavailable_backend("postgres", "backend-postgres")),
+        #[cfg(not(feature = "backend-db2"))]
+        "db2" => Err(unavailable_backend("db2", "backend-db2")),
+        #[cfg(not(feature = "backend-oracle"))]
+        "oracle" => Err(unavailable_backend("oracle", "backend-oracle")),
+        #[cfg(not(feature = "backend-mysql"))]
+        "mysql" => Err(unavailable_backend("mysql", "backend-mysql")),
+
         other => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"other": other})),
-                "Unknown session_backend ''; falling back to sqlite. \
-                 Valid values: 'sqlite' (default), 'jsonl', 'postgres', 'oracle', 'db2', 'mysql'."
+                &format!(
+                    "Unknown session_backend '{other}'; falling back to sqlite. \
+                     Valid values: 'sqlite' (default), 'jsonl', 'postgres', 'oracle', 'db2', 'mysql'."
+                )
             );
             Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?))
         }
     }
+}
+
+/// Error for a known session backend whose Cargo feature was not compiled into
+/// this binary. We fail fast instead of falling back to SQLite so a configured
+/// shared backend never silently degrades to per-host local storage.
+fn unavailable_backend(name: &str, feature: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "session_backend=\"{name}\" is a known backend, but this binary was built without the \
+         `{feature}` feature; rebuild with `--features {feature}` or change \
+         [channels].session_backend. Refusing to silently fall back to local SQLite."
+    ))
 }
 
 /// Open the SQLite backend and, on first open, import any pre-existing
@@ -143,9 +170,11 @@ fn open_sqlite_with_jsonl_import(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"e": e.to_string()})),
-            "session_backend=sqlite: JSONL import skipped: . Existing JSONL \
-             sessions remain on disk; switch to session_backend = \"jsonl\" if \
-             you need them visible immediately."
+            &format!(
+                "session_backend=sqlite: JSONL import skipped: {e}. Existing JSONL \
+                 sessions remain on disk; switch to session_backend = \"jsonl\" if \
+                 you need them visible immediately."
+            )
         ),
     }
     Ok(backend)
@@ -178,6 +207,28 @@ mod tests {
         // The JSONL backend writes one file per session key.
         let jsonl = tmp.path().join("sessions").join("k1.jsonl");
         assert!(jsonl.exists(), "jsonl file must be written under sessions/");
+    }
+
+    // A known backend configured against a binary built without its feature
+    // must fail fast, not silently fall back to SQLite (split-history bug).
+    // (The complementary "unknown value still falls back to sqlite" case is
+    // already covered by make_session_backend_unknown_value_falls_back_to_sqlite.)
+    #[cfg(not(feature = "backend-postgres"))]
+    #[test]
+    fn make_session_backend_known_backend_without_feature_fails_fast() {
+        let tmp = TempDir::new().unwrap();
+        // Arc<dyn SessionBackend> is not Debug, so match rather than expect_err.
+        let err = match make_session_backend(tmp.path(), &channels_with_backend("postgres")) {
+            Ok(_) => {
+                panic!("postgres without backend-postgres must fail fast, not fall back to sqlite")
+            }
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("backend-postgres") && msg.contains("known backend"),
+            "error must name the missing feature and refuse fallback; got: {msg}"
+        );
     }
 
     #[test]
