@@ -81,6 +81,56 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_media_message_body(
+    file_info: &str,
+    msg_seq: u32,
+    in_reply_to: Option<&str>,
+) -> serde_json::Value {
+    let mut body = json!({
+        "msg_type": 7,
+        "media": {
+            "file_info": file_info,
+        },
+        "msg_seq": msg_seq,
+    });
+
+    // Add refer_msg for passive replies (QQ threading/reply support)
+    if let Some(ref_msg_id) = in_reply_to {
+        body["refer_msg"] = json!({
+            "message_id": ref_msg_id,
+        });
+    }
+
+    body
+}
+
+fn build_markdown_message_body(
+    content: &str,
+    msg_seq: u32,
+    in_reply_to: Option<&str>,
+) -> serde_json::Value {
+    let mut body = json!({
+        "markdown": {
+            "content": content,
+        },
+        "msg_type": 2,
+        "msg_seq": msg_seq,
+    });
+
+    // Add refer_msg for passive replies (QQ threading/reply support)
+    if let Some(ref_msg_id) = in_reply_to {
+        body["refer_msg"] = json!({
+            "message_id": ref_msg_id,
+        });
+    }
+
+    body
+}
+
+fn channel_message_id_from(msg_id: &str) -> String {
+    msg_id.to_string()
+}
+
 /// Check whether a file extension is a natively supported QQ voice format.
 fn is_native_voice_ext(ext: &str) -> bool {
     matches!(ext.to_ascii_lowercase().as_str(), "wav" | "mp3" | "silk")
@@ -889,20 +939,7 @@ impl QQChannel {
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let mut body = json!({
-            "msg_type": 7,
-            "media": {
-                "file_info": file_info,
-            },
-            "msg_seq": next_msg_seq(),
-        });
-
-        // Add refer_msg for passive replies (QQ threading/reply support)
-        if let Some(ref_msg_id) = in_reply_to {
-            body["refer_msg"] = json!({
-                "message_id": ref_msg_id,
-            });
-        }
+        let body = build_media_message_body(file_info, next_msg_seq(), in_reply_to);
 
         let resp = self
             .http_client()
@@ -1255,20 +1292,7 @@ impl QQChannel {
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let mut body = json!({
-            "markdown": {
-                "content": content,
-            },
-            "msg_type": 2,
-            "msg_seq": next_msg_seq(),
-        });
-
-        // Add refer_msg for passive replies (QQ threading/reply support)
-        if let Some(ref_msg_id) = in_reply_to {
-            body["refer_msg"] = json!({
-                "message_id": ref_msg_id,
-            });
-        }
+        let body = build_markdown_message_body(content, next_msg_seq(), in_reply_to);
 
         let resp = self
             .http_client()
@@ -1323,7 +1347,7 @@ impl Channel for QQChannel {
         // Send each media attachment
         for attachment in &attachments {
             if let Err(e) = self
-                .send_attachment(&message.recipient, attachment, None)
+                .send_attachment(&message.recipient, attachment, in_reply_to)
                 .await
             {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
@@ -1658,7 +1682,7 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: msg_id.to_string(),
+                                id: channel_message_id_from(msg_id),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -1730,7 +1754,7 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: msg_id.to_string(),
+                                id: channel_message_id_from(msg_id),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -2199,15 +2223,48 @@ allowed_users = ["user1"]
     #[test]
     fn test_send_media_body_msg_type_7() {
         let file_info = "some_file_info_string";
-        let body = json!({
-            "msg_type": 7,
-            "media": {
-                "file_info": file_info,
-            },
-            "msg_seq": 1,
-        });
+        let body = build_media_message_body(file_info, 1, None);
         assert_eq!(body["msg_type"], 7);
         assert_eq!(body["media"]["file_info"], file_info);
+    }
+
+    #[test]
+    fn test_send_media_body_includes_refer_msg_when_replying() {
+        let body = build_media_message_body("some_file_info_string", 1, Some("qq_msg_123"));
+
+        assert_eq!(body["refer_msg"]["message_id"], "qq_msg_123");
+    }
+
+    #[test]
+    fn test_send_media_body_omits_refer_msg_without_reply() {
+        let body = build_media_message_body("some_file_info_string", 1, None);
+
+        assert!(body.get("refer_msg").is_none());
+    }
+
+    #[test]
+    fn test_send_markdown_body_includes_refer_msg_when_replying() {
+        let body = build_markdown_message_body("hello", 1, Some("qq_msg_123"));
+
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hello");
+        assert_eq!(body["refer_msg"]["message_id"], "qq_msg_123");
+    }
+
+    #[test]
+    fn test_send_markdown_body_omits_refer_msg_without_reply() {
+        let body = build_markdown_message_body("hello", 1, None);
+
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hello");
+        assert!(body.get("refer_msg").is_none());
+    }
+
+    #[test]
+    fn test_channel_message_id_uses_qq_msg_id() {
+        let qq_msg_id = "qq_msg_123";
+
+        assert_eq!(channel_message_id_from(qq_msg_id), qq_msg_id);
     }
 
     // --- compose_message_content tests (now async) ---
