@@ -17323,6 +17323,120 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn media_pipeline_preserves_image_bytes_when_vision_route_configured() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let vision_server = MockServer::start().await;
+        let _vision_mock = Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("data:image/png;base64,AQIDBA=="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "vision saw bytes"
+                        }
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&vision_server)
+            .await;
+
+        let base_ctx = peer_prompt_test_context(
+            channels_by_name,
+            provider_impl.clone(),
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            Arc::new(vec![]),
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            multimodal: zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some(format!("custom:{}", vision_server.uri())),
+                vision_model: Some("test-vision-model".to_string()),
+                ..Default::default()
+            },
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*base_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-image-route".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-image-route".to_string(),
+                content: "please inspect this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "route.png".to_string(),
+                    data: vec![1, 2, 3, 4],
+                    mime_type: Some("image/png".to_string()),
+                }],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        {
+            let calls = provider_impl.calls.lock().unwrap();
+            assert!(
+                calls.is_empty(),
+                "default non-vision provider must not receive an image-bearing turn: {calls:?}"
+            );
+        }
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            1,
+            "vision route should send exactly one assistant reply: {sent_messages:?}"
+        );
+        assert!(
+            sent_messages[0].contains("vision saw bytes"),
+            "reply should come from the mock vision provider: {sent_messages:?}"
+        );
+        drop(sent_messages);
+
+        let vision_requests = vision_server
+            .received_requests()
+            .await
+            .expect("mock server should record vision provider requests");
+        assert_eq!(
+            vision_requests.len(),
+            1,
+            "vision provider should receive exactly one request"
+        );
+        let vision_body: serde_json::Value = vision_requests[0]
+            .body_json()
+            .expect("vision provider request should be JSON");
+        assert_eq!(vision_body["model"], "test-vision-model");
+        assert!(
+            vision_body
+                .to_string()
+                .contains("data:image/png;base64,AQIDBA=="),
+            "vision provider request must contain the preserved attachment bytes: {vision_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
