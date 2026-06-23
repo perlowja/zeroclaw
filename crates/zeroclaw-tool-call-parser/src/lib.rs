@@ -943,9 +943,28 @@ const TOOL_CALL_CLOSE_TAGS: [&str; 7] = [
     "</minimax:toolcall>",
 ];
 
+/// ASCII case-insensitive substring search. `needle_lower` must already be
+/// lowercase. Returns the byte index into the ORIGINAL `haystack` — ASCII
+/// lowercasing preserves byte positions and lengths, so the index and any
+/// `needle_lower.len()` slice stay valid against the original string.
+fn find_ascii_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
+    haystack.to_ascii_lowercase().find(needle_lower)
+}
+
+/// Find the earliest tool-call tag, ASCII case-insensitively.
+///
+/// Models emit these tags in mixed case (e.g. Nemotron's `<TOOLCALL>`), and the
+/// envelope *detectors* (`starts_with_tool_protocol_tag_or_fence`,
+/// `contains_tool_protocol_tag_marker`) already lowercase before matching. If
+/// *extraction* stayed case-sensitive, such a call was detected-but-silently
+/// dropped: the agent saw "looks like a tool call" yet pulled zero calls out.
+/// `tags` are canonical lowercase; the returned tag is that canonical form (its
+/// byte length equals the matched text's, so callers can slice with
+/// `tag.len()`).
 fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    let hay_lower = haystack.to_ascii_lowercase();
     tags.iter()
-        .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
+        .filter_map(|tag| hay_lower.find(tag).map(|idx| (idx, *tag)))
         .min_by_key(|(idx, _)| *idx)
 }
 
@@ -1626,7 +1645,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         };
 
         let after_open = &remaining[start + open_tag.len()..];
-        if let Some(close_idx) = after_open.find(close_tag) {
+        if let Some(close_idx) = find_ascii_ci(after_open, close_tag) {
             let inner = &after_open[..close_idx];
             let mut parsed_any = false;
 
@@ -3835,6 +3854,36 @@ Let me check the result."#;
 
         // Names without any dot are unaffected.
         assert_eq!(map_tool_name_alias("file_read"), "file_read");
+    }
+
+    #[test]
+    fn uppercase_toolcall_tag_with_array_and_narration_parses() {
+        // Nemotron-Ultra emits leading narration, then an UPPERCASE <TOOLCALL>
+        // tag wrapping a JSON ARRAY of calls. The envelope detectors lowercase
+        // before matching, so extraction must too — otherwise the call is
+        // detected-but-dropped and the agent stalls with an empty turn.
+        let response = "I need to inspect the providers crate first. Let me read the README.\n\n<TOOLCALL>[{\"name\": \"file_read\", \"arguments\": {\"path\": \"crates/zeroclaw-providers/README.md\"}}]</TOOLCALL>";
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected the <TOOLCALL> array call to parse"
+        );
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(
+            calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            Some("crates/zeroclaw-providers/README.md")
+        );
+    }
+
+    #[test]
+    fn mixed_case_tool_call_tags_parse_with_matching_close() {
+        // Open and close tags in mixed/upper case must both resolve.
+        let response =
+            "<Tool_Call>{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}</TOOL_CALL>";
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1, "mixed-case open + uppercase close tag");
+        assert_eq!(calls[0].name, "shell");
     }
 
     #[test]

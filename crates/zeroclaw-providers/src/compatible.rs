@@ -4148,6 +4148,109 @@ mod tests {
     }
 
     #[test]
+    fn native_request_roundtrips_thought_signature_on_every_parallel_tool_call() {
+        // Gemini 3 multi-call regression: a prior assistant turn carrying a
+        // `thought_signature` on MORE THAN ONE tool call must replay each
+        // signature verbatim when the outgoing request is rebuilt from
+        // history. Dropping any non-first signature makes Gemini reject the
+        // follow-up with "Function call is missing a thought_signature in
+        // functionCall parts ... position 2".
+        let provider = make_model_provider(
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            None,
+        );
+        let history_json = serde_json::json!({
+            "content": serde_json::Value::Null,
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"ls\"}",
+                    "extra_content": {"google": {"thought_signature": "SIG_ZERO"}},
+                },
+                {
+                    "id": "call_1",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"pwd\"}",
+                    "extra_content": {"google": {"thought_signature": "SIG_ONE"}},
+                },
+            ],
+        });
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let req = NativeChatRequest {
+            model: "gemini-3.1-pro-preview".to_string(),
+            messages: provider.convert_messages_for_native(&messages, true),
+            temperature: Some(0.7),
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            extra_body: None,
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        let calls = &value["messages"][0]["tool_calls"];
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"], "SIG_ZERO",
+            "first parallel call must retain its thought_signature"
+        );
+        assert_eq!(
+            calls[1]["extra_content"]["google"]["thought_signature"], "SIG_ONE",
+            "second parallel call must retain its thought_signature (position 2)"
+        );
+    }
+
+    #[test]
+    fn streaming_accumulator_preserves_thought_signature_for_each_index_without_index_key() {
+        // Google's OpenAI-compat streaming omits the per-tool-call `index`
+        // key and carries each signature inside `tool_calls[].extra_content`.
+        // Two parallel calls arriving across separate chunks must each keep
+        // their own signature through the accumulator.
+        let chunk0: StreamChunkResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"SIG0"}},"function":{"arguments":"{\"command\":\"ls\"}","name":"shell"},"id":"fc-0","type":"function"}]}}]}"#,
+        )
+        .unwrap();
+        let chunk1: StreamChunkResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"SIG1"}},"function":{"arguments":"{\"command\":\"pwd\"}","name":"shell"},"id":"fc-1","type":"function"}]}}]}"#,
+        )
+        .unwrap();
+
+        let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
+        for chunk in [chunk0, chunk1] {
+            for choice in &chunk.choices {
+                if let Some(deltas) = choice.delta.tool_calls.as_ref() {
+                    for delta in deltas {
+                        let index = delta.index.unwrap_or(tool_calls.len());
+                        if index >= tool_calls.len() {
+                            tool_calls.resize_with(index + 1, Default::default);
+                        }
+                        if let Some(acc) = tool_calls.get_mut(index) {
+                            acc.apply_delta(delta);
+                        }
+                    }
+                }
+            }
+        }
+        let mut used = std::collections::HashSet::new();
+        let calls: Vec<_> = tool_calls
+            .into_iter()
+            .filter_map(|tc| tc.into_provider_tool_call(false, &mut used))
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].extra_content.as_ref().unwrap()["google"]["thought_signature"],
+            "SIG0"
+        );
+        assert_eq!(
+            calls[1].extra_content.as_ref().unwrap()["google"]["thought_signature"],
+            "SIG1"
+        );
+    }
+
+    #[test]
     fn convert_messages_for_native_keeps_user_image_markers_as_text_when_disabled() {
         let input = vec![ChatMessage::user(
             "System primer [IMAGE:data:image/png;base64,abcd] user turn",
