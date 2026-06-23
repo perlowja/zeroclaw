@@ -1761,7 +1761,15 @@ impl Agent {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        extra_content: None,
+                        // Preserve provider-specific opaque extension fields
+                        // (e.g. Gemini 3 `extra_content.google.thought_signature`)
+                        // when folding the loop's ChatMessage history back into
+                        // the persistent ConversationMessage store. Dropping it
+                        // here breaks the per-tool-call signature round-trip on
+                        // later turns, so Gemini rejects the follow-up request
+                        // with "Function call is missing a thought_signature in
+                        // functionCall parts".
+                        extra_content: c.get("extra_content").cloned(),
                     })
                     .collect();
                 replayed.push(ConversationMessage::AssistantToolCalls {
@@ -4037,6 +4045,63 @@ mod tests {
         );
         assert!(
             matches!(non_system[2], ConversationMessage::ToolResults(r) if r[0].tool_call_id == "tc-1")
+        );
+    }
+
+    #[test]
+    fn replay_loop_messages_preserves_thought_signature_on_every_tool_call() {
+        // Gemini 3 multi-turn regression: the per-tool-call
+        // `extra_content.google.thought_signature` is carried in the loop's
+        // ChatMessage assistant-history JSON (built by
+        // `build_native_assistant_history`). When the round is folded back into
+        // the persistent `ConversationMessage` history, every signature — not
+        // just the first call's — must survive, or a later turn replays the
+        // tool calls without their signatures and Gemini rejects the request
+        // with "Function call is missing a thought_signature in functionCall
+        // parts ... position 2".
+        let assistant_history = crate::agent::turn::build_native_assistant_history(
+            "",
+            &[
+                zeroclaw_providers::ToolCall {
+                    id: "call_0".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: Some(serde_json::json!({
+                        "google": {"thought_signature": "SIG_ZERO"}
+                    })),
+                },
+                zeroclaw_providers::ToolCall {
+                    id: "call_1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"pwd"}"#.into(),
+                    extra_content: Some(serde_json::json!({
+                        "google": {"thought_signature": "SIG_ONE"}
+                    })),
+                },
+            ],
+            None,
+        );
+
+        let replayed = Agent::replay_loop_messages(&[ChatMessage::assistant(assistant_history)]);
+
+        let tool_calls = replayed
+            .iter()
+            .find_map(|m| match m {
+                ConversationMessage::AssistantToolCalls { tool_calls, .. } => Some(tool_calls),
+                _ => None,
+            })
+            .expect("replay must yield an AssistantToolCalls entry");
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(
+            tool_calls[0].extra_content.as_ref().expect("first signature")["google"]
+                ["thought_signature"],
+            "SIG_ZERO"
+        );
+        assert_eq!(
+            tool_calls[1].extra_content.as_ref().expect("second signature")["google"]
+                ["thought_signature"],
+            "SIG_ONE",
+            "non-first tool-call signature must survive history persistence (position 2)"
         );
     }
 
