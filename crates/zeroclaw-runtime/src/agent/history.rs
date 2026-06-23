@@ -261,7 +261,11 @@ pub fn fast_trim_tool_results(
         if msg.role == "tool" && msg.content.len() > trim_to {
             let original_len = msg.content.len();
             msg.content = truncate_tool_message(&msg.content, trim_to);
-            saved += original_len - msg.content.len();
+            // `truncate_tool_message` re-serializes tool-result JSON, which can
+            // yield a string longer than the original (e.g. key reordering or
+            // added escaping when the inner content was already short). Guard
+            // the difference so a non-shrinking rewrite can't underflow/panic.
+            saved += original_len.saturating_sub(msg.content.len());
         }
     }
     saved
