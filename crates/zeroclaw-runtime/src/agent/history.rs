@@ -261,7 +261,11 @@ pub fn fast_trim_tool_results(
         if msg.role == "tool" && msg.content.len() > trim_to {
             let original_len = msg.content.len();
             msg.content = truncate_tool_message(&msg.content, trim_to);
-            saved += original_len - msg.content.len();
+            // `truncate_tool_message` re-serializes tool-result JSON, which can
+            // yield a string longer than the original (e.g. key reordering or
+            // added escaping when the inner content was already short). Guard
+            // the difference so a non-shrinking rewrite can't underflow/panic.
+            saved += original_len.saturating_sub(msg.content.len());
         }
     }
     saved
@@ -611,6 +615,40 @@ mod tests {
         assert!(
             truncated.starts_with(marker),
             "expected head to retain full marker, got: {truncated}"
+        );
+    }
+
+    /// Regression: `fast_trim_tool_results` underflowed `original_len -
+    /// new_len` (panic in debug builds) when `truncate_tool_message` produced
+    /// a *longer* string than the original. This happens for a native
+    /// tool-result envelope whose inner content sits just above the trim
+    /// budget: truncating the inner string to `trim_to` and inserting the
+    /// "[... N characters truncated ...]" marker, then re-serializing the JSON
+    /// envelope, can yield more bytes than went in. The saving must saturate.
+    #[test]
+    fn fast_trim_tool_results_does_not_underflow_when_rewrite_grows() {
+        // Inner content just over the 2000-char trim budget so truncation adds
+        // the marker; wrapped in the native `{tool_call_id, content}` envelope
+        // so `truncate_tool_message` takes the JSON-preserving path.
+        let inner = "a".repeat(2010);
+        let content = serde_json::to_string(&serde_json::json!({
+            "tool_call_id": "call_underflow",
+            "content": inner,
+        }))
+        .unwrap();
+        assert!(content.len() > 2000, "envelope must exceed the trim budget");
+
+        let mut history = vec![zeroclaw_providers::ChatMessage {
+            role: "tool".to_string(),
+            content,
+        }];
+
+        // Must not panic; the rewrite grows, so nothing is saved.
+        let saved = fast_trim_tool_results(&mut history, 0);
+        assert_eq!(saved, 0, "a non-shrinking rewrite must report zero saved");
+        assert!(
+            history[0].content.contains("characters truncated"),
+            "the tool message should have been rewritten through truncation"
         );
     }
 }
