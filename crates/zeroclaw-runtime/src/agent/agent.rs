@@ -4093,13 +4093,17 @@ mod tests {
             .expect("replay must yield an AssistantToolCalls entry");
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(
-            tool_calls[0].extra_content.as_ref().expect("first signature")["google"]
-                ["thought_signature"],
+            tool_calls[0]
+                .extra_content
+                .as_ref()
+                .expect("first signature")["google"]["thought_signature"],
             "SIG_ZERO"
         );
         assert_eq!(
-            tool_calls[1].extra_content.as_ref().expect("second signature")["google"]
-                ["thought_signature"],
+            tool_calls[1]
+                .extra_content
+                .as_ref()
+                .expect("second signature")["google"]["thought_signature"],
             "SIG_ONE",
             "non-first tool-call signature must survive history persistence (position 2)"
         );
