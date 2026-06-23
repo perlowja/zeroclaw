@@ -58,6 +58,7 @@ default = []
 browser-native = ["dep:fantoccini"]
 rag-pdf = ["dep:pdf-extract"]
 probe = ["dep:probe-rs"]
+test-support = []
 
 [dev-dependencies]
 zeroclaw-infra.workspace = true

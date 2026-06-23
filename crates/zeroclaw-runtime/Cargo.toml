@@ -113,6 +113,7 @@ tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 scopeguard = "1.2"
 filetime = "0.2"
+zeroclaw-tools = { workspace = true, features = ["test-support"] }
 
 # Channel features (forwarded to zeroclaw-channels)
 

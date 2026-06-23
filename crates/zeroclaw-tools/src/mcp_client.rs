@@ -15,6 +15,8 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::mcp_protocol::{JSONRPC_VERSION, JsonRpcResponse};
 use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
 use crate::mcp_transport::{McpTransportConn, McpTransportError, create_transport};
 use zeroclaw_config::schema::McpServerConfig;
@@ -431,6 +433,73 @@ impl McpRegistry {
 
     pub fn tool_count(&self) -> usize {
         self.tool_index.len()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_process_ping_tool_for_test(
+        server_name: &str,
+        called: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let tool_name = "ping".to_string();
+        let prefixed_name = format!("{server_name}__{tool_name}");
+        let tools = vec![McpToolDef {
+            name: tool_name.clone(),
+            description: Some("Ping MCP keepalive test".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        }];
+        let config = McpServerConfig {
+            name: server_name.to_string(),
+            ..Default::default()
+        };
+        let server = McpServer {
+            inner: Arc::new(Mutex::new(McpServerInner {
+                config,
+                transport: Box::new(InProcessPingTransportForTest { called }),
+                #[cfg(target_has_atomic = "64")]
+                next_id: AtomicU64::new(1),
+                #[cfg(not(target_has_atomic = "64"))]
+                next_id: AtomicU32::new(1),
+                tools,
+            })),
+        };
+        let mut tool_index = HashMap::new();
+        tool_index.insert(prefixed_name, (0, tool_name));
+        Self {
+            servers: vec![server],
+            tool_index,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct InProcessPingTransportForTest {
+    called: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait::async_trait]
+impl McpTransportConn for InProcessPingTransportForTest {
+    async fn send_and_recv(&mut self, request: &JsonRpcRequest) -> Result<JsonRpcResponse> {
+        if request.method == "tools/call" {
+            self.called.store(true, Ordering::SeqCst);
+        }
+        Ok(JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: request.id.clone(),
+            result: Some(json!({
+                "content": [{"type": "text", "text": "pong from mcp"}],
+                "isError": false,
+            })),
+            error: None,
+        })
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 

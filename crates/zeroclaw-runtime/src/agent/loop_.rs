@@ -963,6 +963,71 @@ type ResolvedAgentForTurnTestHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
 static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentForTurnTestHook>>> =
     LazyLock::new(|| Mutex::new(None));
 
+#[cfg(test)]
+type ModelProviderFactoryTestHook = Arc<dyn Fn() -> Box<dyn ModelProvider> + Send + Sync>;
+
+#[cfg(test)]
+static MODEL_PROVIDER_FACTORY_TEST_HOOK: LazyLock<Mutex<Option<ModelProviderFactoryTestHook>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+type McpRegistryTestHook = Arc<dyn Fn() -> Arc<crate::tools::McpRegistry> + Send + Sync>;
+
+#[cfg(test)]
+static MCP_REGISTRY_TEST_HOOK: LazyLock<Mutex<Option<McpRegistryTestHook>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+async fn connect_mcp_registry_for_agent_loop(
+    servers: &[zeroclaw_config::schema::McpServerConfig],
+) -> Result<std::sync::Arc<crate::tools::McpRegistry>> {
+    #[cfg(test)]
+    if let Some(hook) = MCP_REGISTRY_TEST_HOOK
+        .lock()
+        .expect("MCP registry test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        return Ok(hook());
+    }
+
+    crate::tools::McpRegistry::connect_all(servers)
+        .await
+        .map(std::sync::Arc::new)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_loop_model_provider(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    model_name: &str,
+    options: &zeroclaw_providers::ModelProviderRuntimeOptions,
+) -> Result<Box<dyn ModelProvider>> {
+    #[cfg(test)]
+    if let Some(hook) = MODEL_PROVIDER_FACTORY_TEST_HOOK
+        .lock()
+        .expect("model provider test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        return Ok(hook());
+    }
+
+    zeroclaw_providers::create_routed_model_provider_with_options(
+        config,
+        provider_ref,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        model_name,
+        options,
+    )
+}
+
 /// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
 /// config when `provider_name` is a dotted `<family>.<alias>` reference.
 /// Falls back to `fallback` (the agent's configured provider) for bare family
@@ -1227,6 +1292,11 @@ pub async fn run(
         let mut activated_handle: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
         > = None;
+        // Strong owner for eager MCP wrappers in this direct run. Eager
+        // `McpToolWrapper`s keep only `Weak<McpRegistry>` handles, so this
+        // binding must outlive the tool loop. Deferred mode owns the registry
+        // through `DeferredMcpToolSet`, so it does not use this keepalive.
+        let mut mcp_registry_keepalive: Option<std::sync::Arc<crate::tools::McpRegistry>> = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
@@ -1246,9 +1316,8 @@ pub async fn run(
                     agent_mcp_servers.len()
                 )
             );
-            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+            match connect_mcp_registry_for_agent_loop(&agent_mcp_servers).await {
                 Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy =
                         mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
@@ -1311,6 +1380,7 @@ pub async fn run(
                     } else {
                         // Eager path: register only MCP tools admitted by the
                         // same policy used by deferred MCP discovery.
+                        mcp_registry_keepalive = Some(std::sync::Arc::clone(&registry));
                         let names = registry.tool_names();
                         let mut registered = 0usize;
                         let mut skipped = 0usize;
@@ -1421,17 +1491,16 @@ pub async fn run(
         // (e.g. an xai key) to a different provider family that doesn't expect it.
         let (initial_api_key, initial_uri) =
             api_key_and_uri_for_provider(&config, &provider_name, agent_model_provider);
-        let mut model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
-                &provider_name,
-                initial_api_key.as_deref(),
-                initial_uri.as_deref(),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+        let mut model_provider: Box<dyn ModelProvider> = create_loop_model_provider(
+            &config,
+            &provider_name,
+            initial_api_key.as_deref(),
+            initial_uri.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
 
         let model_switch_callback = get_model_switch_state();
 
@@ -1835,6 +1904,7 @@ pub async fn run(
                 ChatMessage::system(&system_prompt),
                 ChatMessage::user(&enriched),
             ];
+            let _mcp_registry_keepalive = mcp_registry_keepalive.as_ref();
 
             // Prune history for token efficiency (when enabled).
             if agent.resolved.history_pruning.enabled {
@@ -1949,24 +2019,23 @@ pub async fn run(
                                 &new_model_provider,
                                 agent_model_provider,
                             );
-                            model_provider =
-                                zeroclaw_providers::create_routed_model_provider_with_options(
+                            model_provider = create_loop_model_provider(
+                                &config,
+                                &new_model_provider,
+                                switch_api_key.as_deref(),
+                                switch_uri.as_deref(),
+                                &config.reliability,
+                                &config.model_routes,
+                                &new_model,
+                                &zeroclaw_providers::options_for_provider_ref(
                                     &config,
                                     &new_model_provider,
-                                    switch_api_key.as_deref(),
-                                    switch_uri.as_deref(),
-                                    &config.reliability,
-                                    &config.model_routes,
-                                    &new_model,
-                                    &zeroclaw_providers::options_for_provider_ref(
+                                    &zeroclaw_providers::provider_runtime_options_for_agent(
                                         &config,
-                                        &new_model_provider,
-                                        &zeroclaw_providers::provider_runtime_options_for_agent(
-                                            &config,
-                                            agent_alias,
-                                        ),
+                                        agent_alias,
                                     ),
-                                )?;
+                                ),
+                            )?;
 
                             provider_name = new_model_provider;
                             model_name = new_model;
@@ -2830,6 +2899,9 @@ pub async fn process_message(
         let mut activated_handle_pm: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
         > = None;
+        // Strong owner for eager MCP wrappers in this channel/message turn.
+        // Deferred mode owns its registry through `DeferredMcpToolSet`.
+        let mut mcp_registry_keepalive_pm: Option<std::sync::Arc<crate::tools::McpRegistry>> = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
@@ -2849,9 +2921,8 @@ pub async fn process_message(
                     agent_mcp_servers.len()
                 )
             );
-            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+            match connect_mcp_registry_for_agent_loop(&agent_mcp_servers).await {
                 Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy_pm = mcp_tool_access_policy(security.as_ref(), None);
                     if config.mcp.deferred_loading {
@@ -2910,6 +2981,7 @@ pub async fn process_message(
                             tools_registry.push(Box::new(tool_search_pm));
                         }
                     } else {
+                        mcp_registry_keepalive_pm = Some(std::sync::Arc::clone(&registry));
                         let names = registry.tool_names();
                         let mut registered = 0usize;
                         let mut skipped = 0usize;
@@ -2981,19 +3053,18 @@ pub async fn process_message(
             provider_name,
             provider_alias.as_str(),
         );
-        let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
-                &format!("{provider_name}.{provider_alias}"),
-                agent_model_provider
-                    .as_ref()
-                    .and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.as_ref().and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+        let model_provider: Box<dyn ModelProvider> = create_loop_model_provider(
+            &config,
+            &format!("{provider_name}.{provider_alias}"),
+            agent_model_provider
+                .as_ref()
+                .and_then(|e| e.api_key.as_deref()),
+            agent_model_provider.as_ref().and_then(|e| e.uri.as_deref()),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
 
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
@@ -3255,6 +3326,7 @@ pub async fn process_message(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+        let _mcp_registry_keepalive_pm = mcp_registry_keepalive_pm.as_ref();
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
@@ -13108,7 +13180,140 @@ Let me check the result."#;
         assert_eq!(
             matching, 2,
             "run and process_message must both resolve runtime_profiles.*.max_tool_iterations \
-             before provider setup; observed {seen:?}"
+            before provider setup; observed {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_eager_mcp_registry_keepalive_dispatches_tool() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use zeroclaw_config::providers::{ModelProviderRef, RiskProfileRef, RuntimeProfileRef};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, ModelProviderConfig,
+            OpenAIModelProviderConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let temp = tempdir().expect("tempdir should be created");
+        let tool_called = Arc::new(AtomicBool::new(false));
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: temp.path().join("data"),
+            ..Default::default()
+        };
+        config.providers.models.openai.insert(
+            "keepalive".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.risk_profiles.insert(
+            "default".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                ..Default::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 4,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "default".to_string(),
+            AliasedAgentConfig {
+                model_provider: ModelProviderRef::new("openai.keepalive"),
+                risk_profile: RiskProfileRef::new("default"),
+                runtime_profile: RuntimeProfileRef::new("default"),
+                mcp_bundles: vec!["keepalive".to_string()],
+                ..Default::default()
+            },
+        );
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = false;
+        config.mcp.servers.push(McpServerConfig {
+            name: "keepalive".to_string(),
+            command: "unused-by-injected-registry".to_string(),
+            ..Default::default()
+        });
+        config.mcp_bundles.insert(
+            "keepalive".to_string(),
+            McpBundleConfig {
+                servers: vec!["keepalive".to_string()],
+                ..Default::default()
+            },
+        );
+
+        {
+            let tool_called = Arc::clone(&tool_called);
+            let mut hook = MCP_REGISTRY_TEST_HOOK
+                .lock()
+                .expect("MCP registry test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move || {
+                Arc::new(crate::tools::McpRegistry::in_process_ping_tool_for_test(
+                    "keepalive",
+                    Arc::clone(&tool_called),
+                ))
+            }));
+        }
+        {
+            let mut hook = MODEL_PROVIDER_FACTORY_TEST_HOOK
+                .lock()
+                .expect("model provider test hook lock should not be poisoned");
+            *hook = Some(Arc::new(|| {
+                Box::new(ScriptedModelProvider::from_text_responses(vec![
+                    r#"<tool_call>
+{"name":"keepalive__ping","arguments":{}}
+</tool_call>"#,
+                    "mcp final",
+                ]))
+            }));
+        }
+
+        let result = super::run(
+            config,
+            "default",
+            Some("call the eager MCP tool".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        {
+            let mut hook = MCP_REGISTRY_TEST_HOOK
+                .lock()
+                .expect("MCP registry test hook lock should not be poisoned");
+            *hook = None;
+        }
+        {
+            let mut hook = MODEL_PROVIDER_FACTORY_TEST_HOOK
+                .lock()
+                .expect("model provider test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let output = result.expect("agent::run should complete");
+        assert!(
+            output.contains("mcp final"),
+            "scripted provider final response should be returned, got: {output}"
+        );
+        assert!(
+            !output.contains("pong from mcp"),
+            "tool output must be fed back into the scripted model provider, not returned directly"
+        );
+        assert!(
+            tool_called.load(Ordering::SeqCst),
+            "eager MCP wrapper must upgrade its Weak registry and dispatch tools/call"
         );
     }
 
