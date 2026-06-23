@@ -29,11 +29,23 @@ pub(crate) fn build_native_assistant_history(
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
-            serde_json::json!({
+            let mut call = serde_json::json!({
                 "id": tc.id,
                 "name": tc.name,
                 "arguments": tc.arguments,
-            })
+            });
+            // Preserve provider-specific opaque extension fields (e.g. Gemini 3
+            // `extra_content.google.thought_signature`). The provider captures
+            // it on the response and replays it on the next request, but only
+            // if it survives this history serialization — dropping it here made
+            // Gemini reject the follow-up turn with "Function call is missing a
+            // thought_signature in functionCall parts".
+            if let Some(extra) = &tc.extra_content {
+                call.as_object_mut()
+                    .unwrap()
+                    .insert("extra_content".to_string(), extra.clone());
+            }
+            call
         })
         .collect();
 
@@ -294,6 +306,48 @@ pub(crate) async fn interpret_chat_response(
 #[cfg(test)]
 mod tests {
     use super::unforwarded_narration;
+    use super::{ToolCall, build_native_assistant_history};
+
+    #[test]
+    fn native_assistant_history_preserves_extra_content_thought_signature() {
+        // Gemini 3 returns a thoughtSignature in `extra_content` that must
+        // round-trip on the next turn. Serializing the assistant history must
+        // not drop it, or the follow-up request 400s.
+        let calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"command\":\"ls\"}".to_string(),
+            extra_content: Some(serde_json::json!({
+                "google": { "thought_signature": "c2lnbmF0dXJl" }
+            })),
+        }];
+        let history = build_native_assistant_history("", &calls, None);
+        let parsed: serde_json::Value = serde_json::from_str(&history).expect("valid json");
+        let tc = &parsed["tool_calls"][0];
+        assert_eq!(
+            tc["extra_content"]["google"]["thought_signature"]
+                .as_str()
+                .unwrap(),
+            "c2lnbmF0dXJl",
+            "thought_signature must survive history serialization"
+        );
+    }
+
+    #[test]
+    fn native_assistant_history_omits_extra_content_when_absent() {
+        let calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+            extra_content: None,
+        }];
+        let history = build_native_assistant_history("", &calls, None);
+        let parsed: serde_json::Value = serde_json::from_str(&history).expect("valid json");
+        assert!(
+            parsed["tool_calls"][0].get("extra_content").is_none(),
+            "absent extra_content should not emit a key"
+        );
+    }
 
     #[test]
     fn returns_suffix_when_streamed_text_is_a_prefix() {
