@@ -55,7 +55,17 @@ pub(crate) fn collect_tool_results(
         .filter_map(|(i, opt)| opt.map(|v| (i, v)))
     {
         if !loop_ignore_tools.contains(tool_name.as_str()) {
-            detection_relevant_output.push_str(&outcome.output);
+            // Keep failed outputs out of the hash-based identical-output abort
+            // (check_identical_output_abort) too, for the same reason the
+            // pattern detector below is gated: a burst of identical,
+            // argument-independent error strings (rate-limit / action-budget)
+            // would otherwise hash identically and hard-abort the turn — the
+            // exact misfire this PR removes. Successful output still feeds the
+            // hash so the #7143 productive-loop guard (identical *successful*
+            // output) still aborts.
+            if outcome.success {
+                detection_relevant_output.push_str(&outcome.output);
+            }
 
             // Feed the pattern-based loop detector with name + args + result —
             // but only for *successful* calls. Failed calls (e.g. rate-limit /
@@ -299,5 +309,72 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("loop detector"), "got: {err}");
+    }
+
+    /// Drive the *hash-based* identical-output abort
+    /// (`check_identical_output_abort`) directly, with loop detection ACTIVE
+    /// (pacing configured + elapsed), over `n` iterations whose `file_read`
+    /// calls each use different args but return an identical `output` with the
+    /// given `success` flag. Mirrors `run`, but exercises the *second*
+    /// loop-detection mechanism (the hash path) rather than the pattern
+    /// detector.
+    fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {
+        // `Some(0)` => loop detection active immediately (`elapsed() >= 0s`).
+        let pacing = PacingConfig {
+            loop_detection_min_elapsed_secs: Some(0),
+            ..PacingConfig::default()
+        };
+        let loop_started_at = Instant::now();
+        let mut consecutive_identical_outputs = 0usize;
+        let mut last_tool_output_hash: Option<u64> = None;
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        for iteration in 0..n {
+            let mut history: Vec<ChatMessage> = Vec::new();
+            let tool_calls = vec![ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({ "path": format!("file_{iteration}.rs") }),
+                tool_call_id: None,
+            }];
+            let ordered = vec![Some((
+                "file_read".to_string(),
+                None,
+                outcome(output, success),
+            ))];
+            let collected = collect_tool_results(
+                ordered,
+                &tool_calls,
+                &mut history,
+                &mut detector,
+                &ignore,
+                10_000,
+                None,
+                "test-model",
+                iteration,
+                "turn-test",
+            )?;
+            check_identical_output_abort(
+                &collected.detection_relevant_output,
+                loop_started_at,
+                &pacing,
+                &mut consecutive_identical_outputs,
+                &mut last_tool_output_hash,
+                "test-model",
+                iteration,
+                "turn-test",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_identical_outputs_do_not_trip_hash_based_abort() {
+        // The *other* loop-detection mechanism: with loop detection active
+        // (pacing configured + elapsed), a wall of identical *failed* outputs
+        // must not trip the hash-based `check_identical_output_abort`. Gating
+        // `detection_relevant_output` on `outcome.success` keeps failures out
+        // of the hash entirely, so the breaker never fires. Without the gate
+        // this aborts at the third identical failure.
+        assert!(run_hash_path(8, RATE_LIMIT_ERR, false).is_ok());
     }
 }
