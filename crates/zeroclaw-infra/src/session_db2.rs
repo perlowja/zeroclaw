@@ -1,18 +1,15 @@
-//! IBM Db2 12.1.5-backed session persistence (Oracle compatibility mode).
+//! IBM Db2 12.1.5-backed session persistence (NATIVE Db2 — no Oracle compat).
 //!
 //! Connects to Db2 via the standard ODBC CLI driver using the [`odbc-api`]
-//! crate.  The database must be started with Oracle compatibility enabled:
+//! crate.  Requires only a stock Db2 12.1+ instance — it does **NOT** require
+//! Oracle Compatibility Mode (`DB2_COMPATIBILITY_VECTOR=ORA`).
 //!
-//! ```sh
-//! db2set DB2_COMPATIBILITY_VECTOR=ORA
-//! db2stop && db2start
-//! ```
-//!
-//! With Oracle compatibility active, Db2 accepts `DUAL`, `MERGE … USING DUAL`,
-//! `SYSTIMESTAMP`, `GREATEST`, `FETCH FIRST n ROWS ONLY`, `NULLS LAST`,
-//! `VARCHAR2`, `NUMBER`, and `CLOB` — the same syntax used in the Oracle 23ai
-//! backend.  `NUMTODSINTERVAL` is **not** available; timestamp cutoffs are
-//! computed on the Rust side and bound as ISO-8601 strings.
+//! All SQL is Db2-native: `CURRENT TIMESTAMP` (not `CURRENT TIMESTAMP`), native
+//! `MERGE … USING SYSIBM.SYSDUMMY1` upserts, `CASE` (not `GREATEST`),
+//! `FETCH FIRST n ROWS ONLY`, `NULLS LAST`, and native types (`VARCHAR`,
+//! `BIGINT`, `CLOB`, `TIMESTAMP`).  Timestamps are stored as native
+//! `TIMESTAMP` in UTC and bound/parsed as ISO-8601 strings; interval cutoffs
+//! are computed on the Rust side.
 //!
 //! Table and index DDL uses `CREATE TABLE IF NOT EXISTS` (native Db2 12.1+).
 //! Index creation falls back gracefully on SQLSTATE 42710 (index already
@@ -50,7 +47,7 @@ use crate::session_backend::{
     SessionQuery, SessionResult, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use odbc_api::{
     Connection, Cursor, Environment, ParameterCollectionRef, ResultSetMetadata,
     buffers::TextRowSet,
@@ -119,7 +116,7 @@ impl ManageConnection for Db2Manager {
 
 // ── Backend ───────────────────────────────────────────────────────────────
 
-/// IBM Db2 12.1.5-backed session store (Oracle compatibility mode).
+/// IBM Db2 12.1.5-backed session store (native Db2 — no Oracle compat mode).
 pub struct Db2SessionBackend {
     pool: Pool<Db2Manager>,
 }
@@ -149,7 +146,7 @@ impl Db2SessionBackend {
                 SESSION_KEY VARCHAR(512)                  NOT NULL,
                 ROLE        VARCHAR(64)                   NOT NULL,
                 CONTENT     CLOB                          NOT NULL,
-                CREATED_AT  TIMESTAMP WITH TIME ZONE      NOT NULL
+                CREATED_AT  TIMESTAMP(6)      NOT NULL
              )",
             (),
         )
@@ -171,13 +168,13 @@ impl Db2SessionBackend {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS ZC_SESSION_META (
                 SESSION_KEY      VARCHAR(512)            NOT NULL PRIMARY KEY,
-                CREATED_AT       TIMESTAMP WITH TIME ZONE NOT NULL,
-                LAST_ACTIVITY    TIMESTAMP WITH TIME ZONE NOT NULL,
+                CREATED_AT       TIMESTAMP(6) NOT NULL,
+                LAST_ACTIVITY    TIMESTAMP(6) NOT NULL,
                 MESSAGE_COUNT    BIGINT   DEFAULT 0       NOT NULL,
                 NAME             VARCHAR(1024),
                 STATE            VARCHAR(64) DEFAULT 'idle' NOT NULL,
                 TURN_ID          VARCHAR(512),
-                TURN_STARTED_AT  TIMESTAMP WITH TIME ZONE,
+                TURN_STARTED_AT  TIMESTAMP(6),
                 AGENT_ALIAS      VARCHAR(512),
                 CHANNEL_ID       VARCHAR(512),
                 ROOM_ID          VARCHAR(512),
@@ -293,12 +290,20 @@ fn col_opt(row: &[Option<String>], idx: usize) -> Option<String> {
 
 /// Parse an ISO-8601 timestamp string returned by Db2.
 ///
-/// Db2 formats TIMESTAMP WITH TIME ZONE as `"YYYY-MM-DD HH:MM:SS+HH:MM"`.
+/// Parse a native Db2 `TIMESTAMP` string — `"YYYY-MM-DD HH:MM:SS[.ffffff]"`,
+/// stored in UTC with no time-zone offset (Oracle Compatibility Mode is not
+/// used, so there is no `+HH:MM` suffix).
+fn parse_db2_ts(s: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+        .ok()
+        .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+}
+
 fn parse_ts(row: &[Option<String>], idx: usize) -> DateTime<Utc> {
     row.get(idx)
         .and_then(|v| v.as_deref())
-        .and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z").ok())
-        .map(|dt| dt.with_timezone(&Utc))
+        .and_then(parse_db2_ts)
         .unwrap_or_else(Utc::now)
 }
 
@@ -374,16 +379,16 @@ impl SessionBackend for Db2SessionBackend {
         )
         .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        // MERGE for upsert — same syntax works in Oracle compat mode.
+        // MERGE upsert over SYSIBM.SYSDUMMY1 — native Db2 (no Oracle compat).
         conn.execute(
             "MERGE INTO ZC_SESSION_META m
              USING (SELECT ? AS SK FROM SYSIBM.SYSDUMMY1) src ON (m.SESSION_KEY = src.SK)
              WHEN MATCHED THEN UPDATE SET
-                 m.LAST_ACTIVITY  = SYSTIMESTAMP,
+                 m.LAST_ACTIVITY  = CURRENT TIMESTAMP,
                  m.MESSAGE_COUNT  = m.MESSAGE_COUNT + 1
              WHEN NOT MATCHED THEN INSERT
                  (SESSION_KEY, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT)
-             VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 1)",
+             VALUES (src.SK, CURRENT TIMESTAMP, CURRENT TIMESTAMP, 1)",
             &VarCharSlice::new(session_key.as_bytes()),
         )
         .map_err(|e| SessionBackendError::Query(e.to_string()))?;
@@ -417,8 +422,8 @@ impl SessionBackend for Db2SessionBackend {
 
         conn.execute(
             "UPDATE ZC_SESSION_META
-             SET MESSAGE_COUNT = GREATEST(0, MESSAGE_COUNT - 1),
-                 LAST_ACTIVITY  = SYSTIMESTAMP
+             SET MESSAGE_COUNT = CASE WHEN MESSAGE_COUNT - 1 < 0 THEN 0 ELSE MESSAGE_COUNT - 1 END,
+                 LAST_ACTIVITY  = CURRENT TIMESTAMP
              WHERE SESSION_KEY = ?",
             &VarCharSlice::new(session_key.as_bytes()),
         )
@@ -465,7 +470,7 @@ impl SessionBackend for Db2SessionBackend {
         let conn = &g.0;
 
         // Compute the cutoff timestamp in Rust — Db2 does not support
-        // NUMTODSINTERVAL even in Oracle compat mode.
+        // NUMTODSINTERVAL (interval cutoffs are computed Rust-side instead).
         let cutoff = fmt_ts(&(Utc::now() - chrono::Duration::hours(i64::from(ttl_hours))));
 
         let stale: Vec<String> = select_rows(
@@ -602,7 +607,7 @@ impl SessionBackend for Db2SessionBackend {
         let sk = VarCharSlice::new(session_key.as_bytes());
         g.0.execute(
             "UPDATE ZC_SESSION_META
-             SET STATE = ?, TURN_ID = ?, TURN_STARTED_AT = SYSTIMESTAMP
+             SET STATE = ?, TURN_ID = ?, TURN_STARTED_AT = CURRENT TIMESTAMP
              WHERE SESSION_KEY = ?",
             (&st, &turn_id_val, &sk),
         )
@@ -625,11 +630,8 @@ impl SessionBackend for Db2SessionBackend {
             None => return Ok(None),
         };
         // Parse optional TURN_STARTED_AT.
-        let turn_started_at: Option<DateTime<Utc>> = row
-            .get(2)
-            .and_then(|v| v.as_deref())
-            .and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z").ok())
-            .map(|dt| dt.with_timezone(&Utc));
+        let turn_started_at: Option<DateTime<Utc>> =
+            row.get(2).and_then(|v| v.as_deref()).and_then(parse_db2_ts);
         Ok(Some(SessionState {
             state: col_str(&row, 0),
             turn_id: col_opt(&row, 1),
@@ -699,12 +701,8 @@ impl SessionBackend for Db2SessionBackend {
         )
         .into_iter()
         .map(|row| {
-            // parse_ts handles Db2's "YYYY-MM-DD HH:MM:SS±HH:MM" format.
-            let ts = row
-                .get(2)
-                .and_then(|v| v.as_deref())
-                .and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z").ok())
-                .map(|dt| dt.with_timezone(&Utc));
+            // Native Db2 TIMESTAMP, UTC, no tz offset.
+            let ts = row.get(2).and_then(|v| v.as_deref()).and_then(parse_db2_ts);
             TimestampedMessage {
                 message: ChatMessage {
                     role: col_str(&row, 0),
@@ -743,7 +741,7 @@ impl SessionBackend for Db2SessionBackend {
             .map_err(|e| SessionBackendError::Query(e.to_string()))?;
             conn.execute(
                 "UPDATE ZC_SESSION_META
-                 SET MESSAGE_COUNT = 0, LAST_ACTIVITY = SYSTIMESTAMP
+                 SET MESSAGE_COUNT = 0, LAST_ACTIVITY = CURRENT TIMESTAMP
                  WHERE SESSION_KEY = ?",
                 &VarCharSlice::new(session_key.as_bytes()),
             )
@@ -772,7 +770,7 @@ impl SessionBackend for Db2SessionBackend {
              WHEN MATCHED THEN UPDATE SET m.AGENT_ALIAS = src.ALIAS
              WHEN NOT MATCHED THEN INSERT
                  (SESSION_KEY, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT, AGENT_ALIAS)
-             VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.ALIAS)",
+             VALUES (src.SK, CURRENT TIMESTAMP, CURRENT TIMESTAMP, 0, src.ALIAS)",
             (&sk, &alias_val),
         )
         .map_err(|e| SessionBackendError::Query(e.to_string()))?;
@@ -822,7 +820,7 @@ impl SessionBackend for Db2SessionBackend {
              WHEN NOT MATCHED THEN INSERT
                  (SESSION_KEY, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT,
                   CHANNEL_ID, ROOM_ID, SENDER_ID)
-             VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.CID, src.RID, src.SID)",
+             VALUES (src.SK, CURRENT TIMESTAMP, CURRENT TIMESTAMP, 0, src.CID, src.RID, src.SID)",
             (&sk, &channel_id, &room_id, &sender_id),
         )
         .map_err(|e| SessionBackendError::Query(e.to_string()))?;

@@ -12,7 +12,7 @@ backend-postgres = ["dep:native-tls", "dep:postgres", "dep:postgres-native-tls",
 ## Oracle 23ai session backend (adds `oracle`, `r2d2`).
 ## Requires Oracle Instant Client at runtime; set LD_LIBRARY_PATH accordingly.
 backend-oracle = ["dep:oracle", "dep:r2d2"]
-## IBM Db2 12.1.5 session backend in Oracle compatibility mode (adds `odbc-api`, `r2d2`).
+## IBM Db2 12.1.5 session backend — native Db2, no Oracle Compatibility Mode (adds `odbc-api`, `r2d2`).
 ## Requires IBM Db2 CLI / ODBC driver at runtime; set LD_LIBRARY_PATH to the Db2 lib64 dir.
 backend-db2 = ["dep:odbc-api", "dep:r2d2"]
 ## MySQL 9.0+ session backend (adds `mysql`). MySQL's crate ships its own pool.
