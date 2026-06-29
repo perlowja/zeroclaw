@@ -3161,7 +3161,11 @@ impl RpcDispatcher {
                 })?;
                 Ok(value)
             }
-            Err(_) => Ok(Value::Null),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+            Err(e) => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("failed to read org_cost.json: {e}"),
+            )),
         }
     }
 
@@ -4316,6 +4320,62 @@ mod tests {
         assert!(
             !names.contains(&"tool_search") && !names.contains(&"remote__domains.list"),
             "ACP session must skip MCP init (no `tool_search`, no MCP tools); tools: {names:?}"
+        );
+    }
+
+    fn make_cost_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.data_dir = data_dir.to_path_buf();
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-cost:pid=1".into())
+    }
+
+    // cost/org: null only for a genuinely-absent snapshot; any other read failure
+    // (unreadable file, a directory at the path, bad JSON) surfaces as an error so a
+    // broken deployment is not mistaken for a vanilla one. (Audacity88/JordanTheJet, #8482.)
+    #[test]
+    fn cost_org_absent_returns_null() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        assert_eq!(d.handle_cost_org().unwrap(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn cost_org_present_returns_snapshot_verbatim() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("org_cost.json"),
+            r#"{"org":"acme","billed_usd":12.5}"#,
+        )
+        .unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let v = d.handle_cost_org().unwrap();
+        assert_eq!(v["org"], serde_json::json!("acme"));
+        assert_eq!(v["billed_usd"], serde_json::json!(12.5));
+    }
+
+    #[test]
+    fn cost_org_invalid_json_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("org_cost.json"), "not valid json{").unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        assert!(d.handle_cost_org().is_err());
+    }
+
+    #[test]
+    fn cost_org_unreadable_non_notfound_errors() {
+        // A directory at the snapshot path produces a non-NotFound read error; it must
+        // surface as an RPC error, not masquerade as "no snapshot configured".
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("org_cost.json")).unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        assert!(
+            d.handle_cost_org().is_err(),
+            "an unreadable snapshot must not be reported as absent"
         );
     }
 
