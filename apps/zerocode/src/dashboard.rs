@@ -1459,7 +1459,11 @@ impl Dashboard {
             lines.push(Line::from(Span::styled(
                 format!(
                     "  {:<10} {:>12} {:>12} {:>12} {:>7}",
-                    "period", "cost($)", "paid tok", "free tok", "reqs"
+                    crate::i18n::t("zc-dashboard-col-period"),
+                    crate::i18n::t("zc-dashboard-col-cost"),
+                    crate::i18n::t("zc-dashboard-col-paid-tok"),
+                    crate::i18n::t("zc-dashboard-col-free-tok"),
+                    crate::i18n::t("zc-dashboard-col-reqs")
                 ),
                 theme::dim_style(),
             )));
@@ -2410,14 +2414,28 @@ fn org_scope_line(label: &str, scope: &crate::client::OrgScopeStat, frac: f64) -
     Line::from(vec![
         Span::styled(format!("  {label:<14}"), theme::body_style()),
         Span::styled(
-            format!("YTD ${:>14.2}", scope.ytd_cost_usd),
+            format!(
+                "{} ${:>14.2}",
+                crate::i18n::t("zc-dashboard-period-ytd"),
+                scope.ytd_cost_usd
+            ),
             theme::accent_style(),
         ),
         Span::styled(
-            format!("  {:>10} tok", format_tokens(scope.ytd_tokens)),
+            format!(
+                "  {:>10} {}",
+                format_tokens(scope.ytd_tokens),
+                crate::i18n::t("zc-dashboard-org-tok")
+            ),
             theme::dim_style(),
         ),
-        Span::styled(format!("   proj/yr ${proj:>14.2}"), theme::warn_style()),
+        Span::styled(
+            format!(
+                "   {} ${proj:>14.2}",
+                crate::i18n::t("zc-dashboard-org-projyr")
+            ),
+            theme::warn_style(),
+        ),
     ])
 }
 
