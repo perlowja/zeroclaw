@@ -582,12 +582,13 @@ impl CostStorage {
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            &format!(
-                                "Skipping malformed cost record at {}:{}: {error}",
-                                self.path.display().to_string(),
-                                line_number + 1
-                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "path": self.path.display().to_string(),
+                                "line": line_number + 1,
+                                "error": error.to_string(),
+                            })),
+                            "skipping malformed cost record"
                         );
                     }
                 }
